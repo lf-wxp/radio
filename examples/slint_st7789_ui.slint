@@ -1,90 +1,116 @@
 // Slint UI definition file - Demo for ST7789 240x320 LCD display
-export component MainWindow inherits Window {
+// Using Material Design components from material-1.0 library
+
+import { MaterialWindow } from "../material-1.0/material.slint";
+import { MaterialText } from "../material-1.0/material.slint";
+import { MaterialPalette } from "../material-1.0/material.slint";
+import { MaterialTypography } from "../material-1.0/material.slint";
+import { FilledCard, OutlinedCard } from "../material-1.0/material.slint";
+import { HorizontalDivider } from "../material-1.0/material.slint";
+import { SmallAppBar } from "../material-1.0/material.slint";
+import { LinearProgressIndicator } from "../material-1.0/material.slint";
+
+export component MainWindow inherits MaterialWindow {
     width: 240px;
     height: 320px;
 
     in-out property <int> counter: 0;
     in-out property <string> status-text: "ESP32-C6 Radio";
 
-    background: #1a1a2e;
-
     VerticalLayout {
-        alignment: center;
-        spacing: 12px;
-        padding: 16px;
+        spacing: 0;
 
-        // Title
-        Text {
-            text: "ESP Radio";
-            font-size: 24px;
-            color: #00d4ff;
-            horizontal-alignment: center;
+        // Top App Bar
+        SmallAppBar {
+            title: "ESP Radio";
+            show-background: true;
         }
 
-        // Divider
-        Rectangle {
-            height: 2px;
-            background: #16213e;
-        }
+        // Main content area
+        VerticalLayout {
+            padding: 12px;
+            spacing: 12px;
+            alignment: start;
 
-        // Counter display
-        Rectangle {
-            height: 80px;
-            border-radius: 8px;
-            background: #16213e;
+            // Counter card
+            FilledCard {
+                height: 100px;
 
-            VerticalLayout {
-                alignment: center;
-                padding: 8px;
+                VerticalLayout {
+                    alignment: center;
+                    padding: 12px;
+                    spacing: 4px;
 
-                Text {
-                    text: "Counter";
-                    font-size: 14px;
-                    color: #a0a0a0;
-                    horizontal-alignment: center;
-                }
+                    MaterialText {
+                        text: "Counter";
+                        style: MaterialTypography.label-medium;
+                        color: MaterialPalette.on-surface-variant;
+                        horizontal-alignment: center;
+                    }
 
-                Text {
-                    text: root.counter;
-                    font-size: 36px;
-                    color: #e94560;
-                    horizontal-alignment: center;
+                    MaterialText {
+                        text: root.counter;
+                        style: MaterialTypography.display-small;
+                        color: MaterialPalette.primary;
+                        horizontal-alignment: center;
+                    }
                 }
             }
-        }
 
-        // Status info
-        Rectangle {
-            height: 60px;
-            border-radius: 8px;
-            background: #16213e;
+            // Status card
+            OutlinedCard {
+                height: 72px;
 
-            VerticalLayout {
-                alignment: center;
-                padding: 8px;
+                VerticalLayout {
+                    alignment: center;
+                    padding: 12px;
+                    spacing: 4px;
 
-                Text {
-                    text: "Status";
-                    font-size: 12px;
-                    color: #a0a0a0;
-                    horizontal-alignment: center;
-                }
+                    MaterialText {
+                        text: "Status";
+                        style: MaterialTypography.label-small;
+                        color: MaterialPalette.on-surface-variant;
+                        horizontal-alignment: center;
+                    }
 
-                Text {
-                    text: root.status-text;
-                    font-size: 16px;
-                    color: #0f3460;
-                    horizontal-alignment: center;
+                    MaterialText {
+                        text: root.status-text;
+                        style: MaterialTypography.title-medium;
+                        color: MaterialPalette.on-surface;
+                        horizontal-alignment: center;
+                    }
                 }
             }
-        }
 
-        // Footer info
-        Text {
-            text: "Slint + ST7789";
-            font-size: 12px;
-            color: #555555;
-            horizontal-alignment: center;
+            // Progress indicator
+            VerticalLayout {
+                spacing: 4px;
+
+                MaterialText {
+                    text: "Progress";
+                    style: MaterialTypography.label-small;
+                    color: MaterialPalette.on-surface-variant;
+                }
+
+                LinearProgressIndicator {
+                    progress: mod(root.counter, 100) / 100;
+                }
+            }
+
+            // Spacer
+            Rectangle {
+                vertical-stretch: 1;
+            }
+
+            // Footer divider and text
+            HorizontalDivider { }
+
+            MaterialText {
+                text: "Slint + ST7789 Material";
+                style: MaterialTypography.label-small;
+                color: MaterialPalette.outline;
+                horizontal-alignment: center;
+            }
         }
     }
 }
