@@ -74,8 +74,12 @@ async fn main(spawner: Spawner) -> ! {
   // find more examples https://github.com/embassy-rs/trouble/tree/main/examples/esp32
   let transport = BleConnector::new(peripherals.BT, Default::default()).unwrap();
   let ble_controller = ExternalController::<_, 1>::new(transport);
-  let mut resources: HostResources<DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX, ADV_SETS_MAX> =
-    HostResources::new();
+  let mut resources: HostResources<
+    DefaultPacketPool,
+    CONNECTIONS_MAX,
+    L2CAP_CHANNELS_MAX,
+    ADV_SETS_MAX,
+  > = HostResources::new();
   let _stack = trouble_host::new(ble_controller, &mut resources);
 
   // TODO: Spawn some tasks

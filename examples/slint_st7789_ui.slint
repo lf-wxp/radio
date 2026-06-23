@@ -1,0 +1,90 @@
+// Slint UI definition file - Demo for ST7789 240x320 LCD display
+export component MainWindow inherits Window {
+    width: 240px;
+    height: 320px;
+
+    in-out property <int> counter: 0;
+    in-out property <string> status-text: "ESP32-C6 Radio";
+
+    background: #1a1a2e;
+
+    VerticalLayout {
+        alignment: center;
+        spacing: 12px;
+        padding: 16px;
+
+        // Title
+        Text {
+            text: "ESP Radio";
+            font-size: 24px;
+            color: #00d4ff;
+            horizontal-alignment: center;
+        }
+
+        // Divider
+        Rectangle {
+            height: 2px;
+            background: #16213e;
+        }
+
+        // Counter display
+        Rectangle {
+            height: 80px;
+            border-radius: 8px;
+            background: #16213e;
+
+            VerticalLayout {
+                alignment: center;
+                padding: 8px;
+
+                Text {
+                    text: "Counter";
+                    font-size: 14px;
+                    color: #a0a0a0;
+                    horizontal-alignment: center;
+                }
+
+                Text {
+                    text: root.counter;
+                    font-size: 36px;
+                    color: #e94560;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+
+        // Status info
+        Rectangle {
+            height: 60px;
+            border-radius: 8px;
+            background: #16213e;
+
+            VerticalLayout {
+                alignment: center;
+                padding: 8px;
+
+                Text {
+                    text: "Status";
+                    font-size: 12px;
+                    color: #a0a0a0;
+                    horizontal-alignment: center;
+                }
+
+                Text {
+                    text: root.status-text;
+                    font-size: 16px;
+                    color: #0f3460;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+
+        // Footer info
+        Text {
+            text: "Slint + ST7789";
+            font-size: 12px;
+            color: #555555;
+            horizontal-alignment: center;
+        }
+    }
+}

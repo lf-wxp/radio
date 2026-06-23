@@ -1,5 +1,9 @@
 fn main() {
   linker_be_nice();
+
+  // 编译 Slint UI 文件
+  slint_build::compile("examples/slint_st7789_ui.slint").expect("Slint 编译失败");
+
   println!("cargo:rustc-link-arg-tests=-Tembedded-test.x");
   println!("cargo:rustc-link-arg=-Tdefmt.x");
   // make sure linkall.x is the last linker script (otherwise might cause problems with flip-link)
