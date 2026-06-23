@@ -71,8 +71,8 @@ smoltcp = {version = "0.13.1", default-features = false, features = [
 trouble-host = {version = "0.6.0", features = ["gatt"]}
 
 critical-section = "1.2.0"
-static_cell = "2.1.1"
 picoserve = "0.18.0"
+static_cell = "2.1.1"
 
 # Slint UI framework（embedded no_std）
 slint = {version = "1.16", default-features = false, features = [
@@ -83,13 +83,13 @@ slint = {version = "1.16", default-features = false, features = [
 ]}
 
 # ST7789 display driver
-mipidsi = "0.10"
 embedded-graphics = "0.8"
 embedded-graphics-core = "0.4"
 embedded-hal = "1.0"
 embedded-hal-bus = "0.3"
-esp-storage = { version = "0.9.0", features = ["esp32c6", "defmt"] }
 embedded-storage = "0.3.1"
+esp-storage = {version = "0.9.0", features = ["esp32c6", "defmt"]}
+mipidsi = "0.10"
 # Use Cargo's built-in dependency resolution to handle version conflicts
 # Remove patch section and let Cargo resolve the version conflict
 
@@ -123,6 +123,6 @@ opt-level = "s"
 
 [profile.release]
 codegen-units = 1 # LLVM can perform better optimizations using a single thread
-debug = 2 # prefer slower builds but better debugging experience
+debug = false 
 lto = 'fat' 
-opt-level = 's'
+opt-level = 'z'

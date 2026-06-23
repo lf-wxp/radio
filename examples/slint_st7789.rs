@@ -55,7 +55,8 @@ async fn main(_spawner: Spawner) -> ! {
   let peripherals = esp_hal::init(config);
 
   esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 65536);
-  esp_alloc::heap_allocator!(size: 92 * 1024);
+  // Slint software renderer with line-by-line mode needs minimal heap (state + font cache)
+  esp_alloc::heap_allocator!(size: 48 * 1024);
 
   let timg0 = TimerGroup::new(peripherals.TIMG0);
   let sw_interrupt =
