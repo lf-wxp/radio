@@ -4,8 +4,7 @@ fn main() {
   // Compile Slint UI file with Material Design library include path
   let config = slint_build::CompilerConfiguration::new()
     .with_include_paths(vec![std::path::PathBuf::from("material-1.0")]);
-  slint_build::compile_with_config("examples/slint_st7789_ui.slint", config)
-    .expect("Slint compilation failed");
+  slint_build::compile_with_config("ui/main.slint", config).expect("Slint compilation failed");
 
   println!("cargo:rustc-link-arg-tests=-Tembedded-test.x");
   println!("cargo:rustc-link-arg=-Tdefmt.x");

@@ -37,6 +37,13 @@
 use embassy_time::{Duration, Timer};
 
 // ============================================================================
+// Public Types
+// ============================================================================
+
+/// RDS data block types: (Block A, Block B, Block C, Block D)
+pub type RdsBlocks = (u16, u16, u16, u16);
+
+// ============================================================================
 // Constants
 // ============================================================================
 
@@ -506,7 +513,7 @@ impl Si4703 {
   ///
   /// Returns the four RDS blocks (A, B, C, D) if new data is ready,
   /// or `None` if no new RDS data is available.
-  pub fn read_rds<I2C>(&mut self, i2c: &mut I2C) -> Result<Option<(u16, u16, u16, u16)>, I2C::Error>
+  pub fn read_rds<I2C>(&mut self, i2c: &mut I2C) -> Result<Option<RdsBlocks>, I2C::Error>
   where
     I2C: embedded_hal::i2c::I2c,
   {

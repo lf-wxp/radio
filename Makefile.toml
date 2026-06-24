@@ -1,0 +1,155 @@
+# ESP-Radio project cargo-make configuration
+# Usage: cargo make <task>
+# Install: cargo install cargo-make
+
+[env]
+# Target chip
+CHIP = "esp32c6"
+# Build target
+TARGET = "riscv32imac-unknown-none-elf"
+# Default example name
+EXAMPLE = "wifi_provision"
+# defmt log level
+DEFMT_LOG = "info"
+
+# ============================================================
+# Build tasks
+# ============================================================
+
+[tasks.build]
+description = "Build main program (dev profile)"
+command = "cargo"
+args = ["build"]
+
+[tasks.build-release]
+description = "Build main program (release profile)"
+command = "cargo"
+args = ["build", "--release"]
+
+[tasks.build-example]
+description = "Build specified example (via EXAMPLE env var)"
+command = "cargo"
+args = ["build", "--example", "${EXAMPLE}"]
+
+[tasks.build-example-release]
+description = "Build specified example (release profile)"
+command = "cargo"
+args = ["build", "--example", "${EXAMPLE}", "--release"]
+
+[tasks.build-all]
+description = "Build library and all examples"
+command = "cargo"
+args = ["build", "--lib", "--examples"]
+
+[tasks.build-all-release]
+description = "Build library and all examples (release profile)"
+command = "cargo"
+args = ["build", "--lib", "--examples", "--release"]
+
+# ============================================================
+# Flash and run tasks
+# ============================================================
+
+[tasks.flash]
+description = "Build and flash main program to device"
+command = "cargo"
+args = ["run"]
+
+[tasks.flash-release]
+description = "Build and flash main program to device (release profile)"
+command = "cargo"
+args = ["run", "--release"]
+
+# cargo make flash-example -e EXAMPLE=rotary_encoder
+[tasks.flash-example]
+description = "Build and flash specified example to device"
+command = "cargo"
+args = ["run", "--example", "${EXAMPLE}"]
+
+[tasks.flash-example-release]
+description = "Build and flash specified example to device (release profile)"
+command = "cargo"
+args = ["run", "--example", "${EXAMPLE}", "--release"]
+
+# ============================================================
+# Code quality checks
+# ============================================================
+
+[tasks.check]
+description = "Quick type check"
+command = "cargo"
+args = ["check", "--lib", "--examples"]
+
+[tasks.clippy]
+description = "Run clippy code linting"
+command = "cargo"
+args = ["clippy", "--lib", "--examples"]
+
+[tasks.fmt]
+description = "Format code"
+command = "cargo"
+args = ["fmt"]
+
+[tasks.fmt-check]
+description = "Check code formatting (no modifications)"
+command = "cargo"
+args = ["fmt", "--check"]
+
+# ============================================================
+# Clean tasks
+# ============================================================
+
+[tasks.clean]
+description = "Clean build artifacts"
+command = "cargo"
+args = ["clean"]
+
+# ============================================================
+# Firmware size analysis
+# ============================================================
+
+[tasks.size]
+description = "Show main program firmware size"
+dependencies = ["build-release"]
+command = "rust-size"
+args = ["target/${TARGET}/release/radio"]
+
+[tasks.size-example]
+description = "Show specified example firmware size"
+dependencies = ["build-example-release"]
+command = "rust-size"
+args = ["target/${TARGET}/release/examples/${EXAMPLE}"]
+
+# ============================================================
+# Test tasks
+# ============================================================
+
+[tasks.test]
+description = "Run on-device tests"
+command = "cargo"
+args = ["test"]
+
+# ============================================================
+# Monitor tasks
+# ============================================================
+
+[tasks.monitor]
+description = "Monitor device RTT output using probe-rs"
+command = "probe-rs"
+args = ["attach", "--chip", "${CHIP}", "target/${TARGET}/debug/radio", "--always-print-stacktrace"]
+
+# ============================================================
+# Combined workflows
+# ============================================================
+
+[tasks.ci]
+description = "CI pipeline: format check + clippy + build"
+dependencies = ["fmt-check", "clippy", "build-all-release"]
+
+[tasks.dev]
+description = "Development workflow: check + clippy"
+dependencies = ["check", "clippy"]
+
+[tasks.release]
+description = "Release workflow: format check + clippy + release build"
+dependencies = ["fmt-check", "clippy", "build-all-release"]

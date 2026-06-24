@@ -4803,6 +4803,7 @@ dependencies = [
  "mipidsi",
  "panic-rtt-target",
  "picoserve",
+ "portable-atomic",
  "rtt-target",
  "slint",
  "slint-build",

@@ -76,7 +76,10 @@ async fn main(spawner: Spawner) -> ! {
 
   match wifi {
     Ok(connected) => {
-      info!("=== WiFi connected! SSID: \"{}\" ===", connected.ssid.as_str());
+      info!(
+        "=== WiFi connected! SSID: \"{}\" ===",
+        connected.ssid.as_str()
+      );
       info!("Application is now running with network access.");
 
       // Application main loop - use connected.stack for TCP/UDP

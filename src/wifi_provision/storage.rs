@@ -95,7 +95,7 @@ impl<'d> CredentialStorage<'d> {
   /// Panics if offset is not sector-aligned.
   pub fn with_offset(flash: FlashStorage<'d>, offset: u32) -> Self {
     assert!(
-      offset % FlashStorage::SECTOR_SIZE == 0,
+      offset.is_multiple_of(FlashStorage::SECTOR_SIZE),
       "storage offset must be sector-aligned"
     );
     Self { flash, offset }

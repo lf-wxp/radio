@@ -122,7 +122,7 @@ async fn main(_spawner: Spawner) -> ! {
   slint::platform::set_platform(Box::new(platform)).expect("Set Slint platform failed");
 
   // Create Slint UI instance
-  let ui = MainWindow::new().expect("Create UI failed");
+  let ui = ExampleWindow::new().expect("Create UI failed");
   let ui_weak = ui.as_weak();
 
   info!("Slint UI initialized!");

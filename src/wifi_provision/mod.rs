@@ -28,8 +28,8 @@ use embassy_net::{Ipv4Address, Ipv4Cidr, StackResources, StaticConfigV4};
 use embassy_time::{Duration, Timer};
 use embedded_io_async::Write;
 use esp_radio::wifi::{
-  Config as WifiConfig, ControllerConfig, Interface, WifiController,
-  ap::AccessPointConfig, sta::StationConfig,
+  Config as WifiConfig, ControllerConfig, Interface, WifiController, ap::AccessPointConfig,
+  sta::StationConfig,
 };
 use esp_storage::FlashStorage;
 
@@ -260,8 +260,8 @@ fn url_decode(input: &str) -> String {
     match b {
       b'+' => output.push(' '),
       b'%' => {
-        let hi = chars.next().and_then(|c| hex_val(c));
-        let lo = chars.next().and_then(|c| hex_val(c));
+        let hi = chars.next().and_then(hex_val);
+        let lo = chars.next().and_then(hex_val);
         if let (Some(h), Some(l)) = (hi, lo) {
           output.push((h << 4 | l) as char);
         }
@@ -343,10 +343,10 @@ pub fn parse_http_request(buf: &[u8], len: usize) -> Option<HttpRequest<'_>> {
   let mut content_length = 0;
   for line in headers_part.lines().skip(1) {
     let lower = line.to_ascii_lowercase();
-    if lower.starts_with("content-length:") {
-      if let Some(val) = line.split(':').nth(1) {
-        content_length = val.trim().parse().unwrap_or(0);
-      }
+    if lower.starts_with("content-length:")
+      && let Some(val) = line.split(':').nth(1)
+    {
+      content_length = val.trim().parse().unwrap_or(0);
     }
   }
 
@@ -492,10 +492,7 @@ impl<'d> WifiProvisioner<'d> {
   ///
   /// Returns `Ok(())` on success, or `Err(StorageError)` if the
   /// save operation fails.
-  pub fn save_credentials(
-    &mut self,
-    credentials: &WifiCredentials,
-  ) -> Result<(), StorageError> {
+  pub fn save_credentials(&mut self, credentials: &WifiCredentials) -> Result<(), StorageError> {
     self.storage.save(credentials)
   }
 
@@ -545,7 +542,10 @@ impl<'d> WifiProvisioner<'d> {
   ) -> Result<ConnectedWifi, ConnectionError> {
     // Step 1: Get credentials (from Flash or via provisioning)
     let credentials = if let Some(creds) = self.load_credentials() {
-      defmt::info!("Loaded saved credentials, SSID: \"{}\"", creds.ssid.as_str());
+      defmt::info!(
+        "Loaded saved credentials, SSID: \"{}\"",
+        creds.ssid.as_str()
+      );
       creds
     } else {
       defmt::info!("No saved credentials. Starting provisioning...");
@@ -572,14 +572,7 @@ impl<'d> WifiProvisioner<'d> {
     };
 
     // Step 2: Connect in Station mode
-    let result = connect_station(
-      spawner,
-      wifi,
-      &credentials,
-      conn_config,
-      stack_resources,
-    )
-    .await;
+    let result = connect_station(spawner, wifi, &credentials, conn_config, stack_resources).await;
 
     match result {
       Ok(connected) => Ok(connected),
@@ -627,10 +620,12 @@ pub async fn connect_station(
     ControllerConfig::default().with_initial_config(WifiConfig::Station(sta_config));
 
   let (mut wifi_controller, interfaces) =
-    esp_radio::wifi::new(wifi, controller_config)
-      .map_err(|_| ConnectionError::WifiInit)?;
+    esp_radio::wifi::new(wifi, controller_config).map_err(|_| ConnectionError::WifiInit)?;
 
-  defmt::info!("WiFi initialized. Connecting to \"{}\"...", credentials.ssid.as_str());
+  defmt::info!(
+    "WiFi initialized. Connecting to \"{}\"...",
+    credentials.ssid.as_str()
+  );
 
   // Set up network stack with DHCP
   let net_config = embassy_net::Config::dhcpv4(Default::default());
@@ -707,7 +702,8 @@ pub async fn run_provisioning_server(
 
   let net_config = embassy_net::Config::ipv4_static(static_config);
   let seed = 0x1234_5678_9abc_def0u64;
-  let (stack, runner) = embassy_net::new(interfaces.access_point, net_config, stack_resources, seed);
+  let (stack, runner) =
+    embassy_net::new(interfaces.access_point, net_config, stack_resources, seed);
 
   spawner.spawn(net_task(runner).expect("Failed to create net_task"));
 
@@ -716,7 +712,11 @@ pub async fn run_provisioning_server(
   stack.wait_link_up().await;
   defmt::info!(
     "AP ready! IP: {}.{}.{}.{} - Connect to \"{}\"",
-    gw[0], gw[1], gw[2], gw[3], config.ap_ssid
+    gw[0],
+    gw[1],
+    gw[2],
+    gw[3],
+    config.ap_ssid
   );
 
   // HTTP Server - Captive Portal
@@ -740,13 +740,17 @@ pub async fn run_provisioning_server(
         Ok(0) => break,
         Ok(n) => {
           total_read += n;
-          if let Some(_) = buf[..total_read].windows(4).position(|w| w == b"\r\n\r\n") {
+          if buf[..total_read]
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .is_some()
+          {
             let request_str = core::str::from_utf8(&buf[..total_read]).unwrap_or("");
             if request_str.starts_with("POST") {
-              if let Some(req) = parse_http_request(&buf, total_read) {
-                if req.body.len() >= req.content_length {
-                  break;
-                }
+              if let Some(req) = parse_http_request(&buf, total_read)
+                && req.body.len() >= req.content_length
+              {
+                break;
               }
             } else {
               break;
@@ -761,7 +765,7 @@ pub async fn run_provisioning_server(
     }
 
     if total_read == 0 {
-      let _ = socket.close();
+      socket.close();
       continue;
     }
 
@@ -792,7 +796,7 @@ pub async fn run_provisioning_server(
             let _ = socket.write_all(&response_buf[..len]).await;
             let _ = socket.flush().await;
             Timer::after(Duration::from_millis(500)).await;
-            let _ = socket.close();
+            socket.close();
 
             return creds;
           } else {
@@ -814,7 +818,7 @@ pub async fn run_provisioning_server(
 
     let _ = socket.write_all(&response_buf[..response_len]).await;
     let _ = socket.flush().await;
-    let _ = socket.close();
+    socket.close();
   }
 }
 
@@ -855,15 +859,15 @@ async fn wait_for_dhcp_ip(stack: embassy_net::Stack<'_>) {
   loop {
     if let Some(config) = stack.config_v4() {
       let addr = config.address.address().octets();
-      defmt::info!(
-        "Got IP: {}.{}.{}.{}",
-        addr[0], addr[1], addr[2], addr[3]
-      );
+      defmt::info!("Got IP: {}.{}.{}.{}", addr[0], addr[1], addr[2], addr[3]);
       if let Some(gw) = config.gateway {
         let gw_octets = gw.octets();
         defmt::info!(
           "Gateway: {}.{}.{}.{}",
-          gw_octets[0], gw_octets[1], gw_octets[2], gw_octets[3]
+          gw_octets[0],
+          gw_octets[1],
+          gw_octets[2],
+          gw_octets[3]
         );
       }
       break;

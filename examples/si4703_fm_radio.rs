@@ -86,7 +86,8 @@ async fn main(_spawner: Spawner) -> ! {
   Timer::after(Duration::from_millis(10)).await;
 
   // Step 3: Release SDIO - now the chip is in I2C mode
-  drop(sdio_pin);
+  // Release ownership of sdio_pin so it can be used as I2C SDA later
+  let _released = sdio_pin;
 
   info!("Si4703 reset sequence complete, entering I2C mode");
 
@@ -142,7 +143,7 @@ async fn main(_spawner: Spawner) -> ! {
   let station_count = match radio.scan_stations(&mut i2c, &mut stations).await {
     Ok(count) => {
       info!("Scan complete! Found {} stations:", count);
-      for i in 0..count {
+      for (i, _) in stations.iter().enumerate().take(count) {
         let (mhz, dec) = format_freq(stations[i].freq_mhz_x10);
         info!("  [{}] {}.{} MHz (RSSI: {})", i, mhz, dec, stations[i].rssi);
       }
@@ -161,7 +162,7 @@ async fn main(_spawner: Spawner) -> ! {
     // Find station with highest RSSI
     let mut best_idx = 0;
     let mut best_rssi = 0u8;
-    for i in 0..station_count {
+    for (i, _) in stations.iter().enumerate().take(station_count) {
       if stations[i].rssi > best_rssi {
         best_rssi = stations[i].rssi;
         best_idx = i;
@@ -195,29 +196,29 @@ async fn main(_spawner: Spawner) -> ! {
     loop_counter += 1;
 
     // Read RDS data every iteration
-    if let Ok(Some((a, b, c, d))) = radio.read_rds(&mut i2c) {
-      if rds_decoder.process(a, b, c, d) {
-        info!("RDS Station Name: {:a}", rds_decoder.station_name_str());
-      }
+    if let Ok(Some((a, b, c, d))) = radio.read_rds(&mut i2c)
+      && rds_decoder.process(a, b, c, d)
+    {
+      info!("RDS Station Name: {:a}", rds_decoder.station_name_str());
     }
 
     // Print status every 5 seconds
-    if loop_counter % 50 == 0 {
-      if let Ok(freq) = radio.current_frequency(&mut i2c) {
-        let rssi = radio.rssi(&mut i2c).unwrap_or(0);
-        let (mhz, dec) = format_freq(freq);
-        info!(
-          "Status: {}.{} MHz | RSSI: {} | Vol: {}/15",
-          mhz,
-          dec,
-          rssi,
-          radio.volume()
-        );
-      }
+    if loop_counter.is_multiple_of(50)
+      && let Ok(freq) = radio.current_frequency(&mut i2c)
+    {
+      let rssi = radio.rssi(&mut i2c).unwrap_or(0);
+      let (mhz, dec) = format_freq(freq);
+      info!(
+        "Status: {}.{} MHz | RSSI: {} | Vol: {}/15",
+        mhz,
+        dec,
+        rssi,
+        radio.volume()
+      );
     }
 
     // Demonstrate seek every 30 seconds (seek to next station)
-    if loop_counter % 300 == 0 {
+    if loop_counter.is_multiple_of(300) {
       info!("Seeking next station...");
       match radio.seek(&mut i2c, SeekDirection::Up).await {
         Ok(Some(freq)) => {

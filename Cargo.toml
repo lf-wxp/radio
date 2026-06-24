@@ -72,6 +72,7 @@ trouble-host = {version = "0.6.0", features = ["gatt"]}
 
 critical-section = "1.2.0"
 picoserve = "0.18.0"
+portable-atomic = {version = "1", default-features = false}
 static_cell = "2.1.1"
 
 # Slint UI framework（embedded no_std）
@@ -114,6 +115,10 @@ path = "examples/si4703_fm_radio.rs"
 [[example]]
 name = "wifi_provision"
 path = "examples/wifi_provision.rs"
+
+[[example]]
+name = "rotary_encoder"
+path = "examples/rotary_encoder.rs"
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html
 [profile.dev]
