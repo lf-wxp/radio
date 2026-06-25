@@ -27,6 +27,7 @@ use embassy_executor::Spawner;
 use embassy_net::{Ipv4Address, Ipv4Cidr, StackResources, StaticConfigV4};
 use embassy_time::{Duration, Timer};
 use embedded_io_async::Write;
+use esp_hal::rng::Rng;
 use esp_radio::wifi::{
   Config as WifiConfig, ControllerConfig, Interface, WifiController, ap::AccessPointConfig,
   sta::StationConfig,
@@ -314,6 +315,59 @@ pub struct HttpRequest<'a> {
   pub content_length: usize,
 }
 
+/// Helper for writing formatted content into a fixed-size buffer.
+///
+/// Implements `core::fmt::Write` with **all-or-nothing** semantics: if a
+/// chunk would overflow the buffer, the write is rejected entirely
+/// (without partially copying bytes) and `Err(fmt::Error)` is returned.
+/// This guarantees that on overflow the caller can detect the failure
+/// and the buffer contents up to `pos` remain a valid prefix of the
+/// requested format string.
+struct BufWriter<'a> {
+  buf: &'a mut [u8],
+  pos: usize,
+  /// Sticky overflow flag: once set, all subsequent writes return Err.
+  overflowed: bool,
+}
+
+impl<'a> BufWriter<'a> {
+  fn new(buf: &'a mut [u8]) -> Self {
+    Self {
+      buf,
+      pos: 0,
+      overflowed: false,
+    }
+  }
+
+  /// Returns `Some(written_len)` if the whole format succeeded, `None` if
+  /// any write overflowed (in which case `pos` represents how far we got).
+  fn finish(self) -> Option<usize> {
+    if self.overflowed {
+      None
+    } else {
+      Some(self.pos)
+    }
+  }
+}
+
+impl<'a> core::fmt::Write for BufWriter<'a> {
+  fn write_str(&mut self, s: &str) -> fmt::Result {
+    if self.overflowed {
+      return Err(fmt::Error);
+    }
+    let bytes = s.as_bytes();
+    let remaining = self.buf.len() - self.pos;
+    if bytes.len() > remaining {
+      // All-or-nothing: refuse the partial write and remember the failure.
+      self.overflowed = true;
+      return Err(fmt::Error);
+    }
+    self.buf[self.pos..self.pos + bytes.len()].copy_from_slice(bytes);
+    self.pos += bytes.len();
+    Ok(())
+  }
+}
+
 /// Parse a raw HTTP request from a byte buffer.
 ///
 /// This is a minimal parser that extracts method, path, content-length, and body.
@@ -341,9 +395,11 @@ pub fn parse_http_request(buf: &[u8], len: usize) -> Option<HttpRequest<'_>> {
 
   // Parse Content-Length
   let mut content_length = 0;
+  const CL_HEADER: &[u8] = b"content-length:";
   for line in headers_part.lines().skip(1) {
-    let lower = line.to_ascii_lowercase();
-    if lower.starts_with("content-length:")
+    let line_bytes = line.as_bytes();
+    if line_bytes.len() >= CL_HEADER.len()
+      && line_bytes[..CL_HEADER.len()].eq_ignore_ascii_case(CL_HEADER)
       && let Some(val) = line.split(':').nth(1)
     {
       content_length = val.trim().parse().unwrap_or(0);
@@ -359,6 +415,9 @@ pub fn parse_http_request(buf: &[u8], len: usize) -> Option<HttpRequest<'_>> {
 }
 
 /// Format an HTTP response with the given status code, content type, and body.
+///
+/// Returns the number of bytes written, or `0` if the response did not fit
+/// in `buf` (caller should treat 0 as a hard failure and close the socket).
 pub fn format_http_response(
   buf: &mut [u8],
   status: u16,
@@ -368,27 +427,7 @@ pub fn format_http_response(
 ) -> usize {
   use core::fmt::Write;
 
-  struct BufWriter<'a> {
-    buf: &'a mut [u8],
-    pos: usize,
-  }
-
-  impl<'a> Write for BufWriter<'a> {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-      let bytes = s.as_bytes();
-      let remaining = self.buf.len() - self.pos;
-      let to_write = bytes.len().min(remaining);
-      self.buf[self.pos..self.pos + to_write].copy_from_slice(&bytes[..to_write]);
-      self.pos += to_write;
-      if to_write < bytes.len() {
-        Err(fmt::Error)
-      } else {
-        Ok(())
-      }
-    }
-  }
-
-  let mut writer = BufWriter { buf, pos: 0 };
+  let mut writer = BufWriter::new(buf);
   let _ = write!(
     writer,
     "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -399,41 +438,23 @@ pub fn format_http_response(
     body
   );
 
-  writer.pos
+  writer.finish().unwrap_or(0)
 }
 
 /// Format a redirect HTTP response (302 Found).
+///
+/// Returns the number of bytes written, or `0` if the response did not fit.
 pub fn format_redirect_response(buf: &mut [u8], location: &str) -> usize {
   use core::fmt::Write;
 
-  struct BufWriter<'a> {
-    buf: &'a mut [u8],
-    pos: usize,
-  }
-
-  impl<'a> Write for BufWriter<'a> {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-      let bytes = s.as_bytes();
-      let remaining = self.buf.len() - self.pos;
-      let to_write = bytes.len().min(remaining);
-      self.buf[self.pos..self.pos + to_write].copy_from_slice(&bytes[..to_write]);
-      self.pos += to_write;
-      if to_write < bytes.len() {
-        Err(fmt::Error)
-      } else {
-        Ok(())
-      }
-    }
-  }
-
-  let mut writer = BufWriter { buf, pos: 0 };
+  let mut writer = BufWriter::new(buf);
   let _ = write!(
     writer,
     "HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
     location
   );
 
-  writer.pos
+  writer.finish().unwrap_or(0)
 }
 
 /// WiFi provisioner that encapsulates credential storage logic.
@@ -629,7 +650,9 @@ pub async fn connect_station(
 
   // Set up network stack with DHCP
   let net_config = embassy_net::Config::dhcpv4(Default::default());
-  let seed = 0xabcd_ef01_2345_6789u64;
+  // Hardware RNG provides true random seed once WiFi is enabled.
+  let rng = Rng::new();
+  let seed = (u64::from(rng.random()) << 32) | u64::from(rng.random());
   let (stack, runner) = embassy_net::new(interfaces.station, net_config, stack_resources, seed);
 
   let token = net_task(runner).map_err(|_| ConnectionError::WifiInit)?;
@@ -701,7 +724,9 @@ pub async fn run_provisioning_server(
   };
 
   let net_config = embassy_net::Config::ipv4_static(static_config);
-  let seed = 0x1234_5678_9abc_def0u64;
+  // Hardware RNG provides true random seed once WiFi is enabled.
+  let rng = Rng::new();
+  let seed = (u64::from(rng.random()) << 32) | u64::from(rng.random());
   let (stack, runner) =
     embassy_net::new(interfaces.access_point, net_config, stack_resources, seed);
 

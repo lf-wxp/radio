@@ -153,3 +153,62 @@ dependencies = ["check", "clippy"]
 [tasks.release]
 description = "Release workflow: format check + clippy + release build"
 dependencies = ["fmt-check", "clippy", "build-all-release"]
+
+# ============================================================
+# UI preview tasks (host-side, no ESP32 hardware needed)
+# ============================================================
+# Slint UI files can be previewed on the host machine using `slint-viewer`.
+# This is independent of the embedded firmware build and useful for fast
+# iteration on layout, colors, fonts, RDS marquee, etc.
+#
+# macOS note:
+#   On macOS 26 (Tahoe) / Xcode 26+, the system SDK headers require clang to
+#   receive an explicit `-target` triple. Some transitive build dependencies
+#   of slint-viewer (e.g. `bonjour-sys`) drive `bindgen` directly and would
+#   otherwise fail with `architecture not supported` from <machine/_types.h>.
+#   We therefore export `SDKROOT` and `BINDGEN_EXTRA_CLANG_ARGS` for every
+#   UI task below so users do not need to set them manually.
+
+[tasks.ui-install-viewer]
+description = "Install slint-viewer (host UI preview tool)"
+install_crate = {crate_name = "slint-viewer", binary = "slint-viewer", test_arg = "--version"}
+command = "slint-viewer"
+args = ["--version"]
+
+[tasks.ui-install-viewer.env]
+SDKROOT = {script = ["xcrun --show-sdk-path 2>/dev/null || echo"]}
+BINDGEN_EXTRA_CLANG_ARGS = {script = [
+  "sdk=$(xcrun --show-sdk-path 2>/dev/null); if [ -n \"$sdk\" ]; then echo \"-isysroot $sdk -target $(uname -m)-apple-darwin\"; else echo; fi",
+]}
+MACOSX_DEPLOYMENT_TARGET = "14.0"
+
+[tasks.ui-preview]
+description = "Live-preview the radio UI on the host (auto-reload on save)"
+install_crate = {crate_name = "slint-viewer", binary = "slint-viewer", test_arg = "--version"}
+command = "slint-viewer"
+args = ["-I", "material-1.0", "--auto-reload", "ui/radio_ui.slint"]
+
+[tasks.ui-preview.env]
+SDKROOT = {script = ["xcrun --show-sdk-path 2>/dev/null || echo"]}
+BINDGEN_EXTRA_CLANG_ARGS = {script = [
+  "sdk=$(xcrun --show-sdk-path 2>/dev/null); if [ -n \"$sdk\" ]; then echo \"-isysroot $sdk -target $(uname -m)-apple-darwin\"; else echo; fi",
+]}
+MACOSX_DEPLOYMENT_TARGET = "14.0"
+
+[tasks.ui-preview-data]
+description = "Live-preview the radio UI with sample data (RDS / volume / signal)"
+install_crate = {crate_name = "slint-viewer", binary = "slint-viewer", test_arg = "--version"}
+command = "slint-viewer"
+args = [
+  "-I", "material-1.0",
+  "--auto-reload",
+  "--load-data", "ui/preview_data.json",
+  "ui/radio_ui.slint",
+]
+
+[tasks.ui-preview-data.env]
+SDKROOT = {script = ["xcrun --show-sdk-path 2>/dev/null || echo"]}
+BINDGEN_EXTRA_CLANG_ARGS = {script = [
+  "sdk=$(xcrun --show-sdk-path 2>/dev/null); if [ -n \"$sdk\" ]; then echo \"-isysroot $sdk -target $(uname -m)-apple-darwin\"; else echo; fi",
+]}
+MACOSX_DEPLOYMENT_TARGET = "14.0"

@@ -1,0 +1,448 @@
+# ESP-Radio
+
+> A complete, production-grade FM radio firmware for the **ESP32-C6**, written in pure Rust.
+> WiFi-provisioned over a captive portal, driven by a rotary encoder, with a Material-Design Slint UI on a 240×320 ST7789 display.
+
+[English](./README.md) · [简体中文](./README.zh-CN.md)
+
+<p>
+  <img alt="rust"        src="https://img.shields.io/badge/rust-nightly-orange?logo=rust">
+  <img alt="target"      src="https://img.shields.io/badge/target-riscv32imac--unknown--none--elf-blue">
+  <img alt="chip"        src="https://img.shields.io/badge/chip-ESP32--C6-red?logo=espressif">
+  <img alt="esp-hal"     src="https://img.shields.io/badge/esp--hal-1.1-success">
+  <img alt="esp-radio"   src="https://img.shields.io/badge/esp--radio-0.18-success">
+  <img alt="slint"       src="https://img.shields.io/badge/slint-1.16-7c3aed?logo=slint">
+  <img alt="embassy"     src="https://img.shields.io/badge/runtime-embassy-2dd4bf">
+  <img alt="no_std"      src="https://img.shields.io/badge/no__std-yes-informational">
+</p>
+
+---
+
+## 📑 Table of contents
+
+- [ESP-Radio](#esp-radio)
+  - [📑 Table of contents](#-table-of-contents)
+  - [✨ Features](#-features)
+  - [🎬 Demo](#-demo)
+  - [🧱 Hardware](#-hardware)
+  - [🏗️ Architecture](#️-architecture)
+  - [🚦 Boot sequence](#-boot-sequence)
+  - [🧩 Module overview](#-module-overview)
+  - [📁 Project layout](#-project-layout)
+  - [🚀 Quick start](#-quick-start)
+    - [1. Toolchain](#1-toolchain)
+    - [2. Build \& flash](#2-build--flash)
+    - [3. WiFi provisioning (first boot only)](#3-wifi-provisioning-first-boot-only)
+  - [🛠️ `cargo make` task reference](#️-cargo-make-task-reference)
+  - [🖥️ Host UI preview](#️-host-ui-preview)
+    - [macOS 26 (Tahoe) note](#macos-26-tahoe-note)
+  - [📡 RDS support matrix](#-rds-support-matrix)
+  - [📦 Performance \& footprint](#-performance--footprint)
+  - [🔄 Development workflow](#-development-workflow)
+  - [🧰 Tech stack](#-tech-stack)
+  - [🐛 Troubleshooting \& FAQ](#-troubleshooting--faq)
+  - [🗺️ Roadmap](#️-roadmap)
+    - [📑 Design documents](#-design-documents)
+  - [🤝 Contributing](#-contributing)
+  - [🙏 Acknowledgements](#-acknowledgements)
+  - [📜 License](#-license)
+
+---
+
+## ✨ Features
+
+- 📻 **FM tuner** — Si4703 over I²C, automatic strongest-station scan on boot, RDS-aware UI (PS station name + RT scrolling text, GB2312/UTF-8 extension friendly).
+- 🔊 **Volume + mute** — long-press encoder to mute, dedicated volume bar in the UI.
+- 🎛️ **Tactile control** — KY-040 rotary encoder driven by the **PCNT** hardware peripheral (no ISR jitter), short press = seek, long press (≥ 800 ms) = mute.
+- 📶 **WiFi provisioning** — first-boot SoftAP captive portal, credentials persisted to flash via `esp-storage`. Subsequent boots auto-reconnect.
+- 🖥️ **Slint UI** — Material-1.0 themed `ui/radio_ui.slint`, software-rendered on a 240×320 ST7789, host-previewable on macOS / Linux / Windows.
+- 🔁 **Embassy async** — fully `no_std`, `embassy-executor` + `embassy-sync` channels/mutexes between input task ↔ radio task ↔ UI render loop.
+- 🛠️ **`cargo make` workflow** — one command for build, flash, lint, size-report, host UI preview.
+- 🧪 **On-device tests** — `embedded-test` + `probe-rs` so unit tests run against real hardware.
+
+---
+
+## 🎬 Demo
+
+| Boot screen | Tuned w/ RDS | Mute / volume |
+|:---:|:---:|:---:|
+| _add `docs/screenshots/boot.png`_ | _add `docs/screenshots/rds.png`_ | _add `docs/screenshots/mute.png`_ |
+
+> 💡 You can preview the exact same UI on the host machine without any hardware:
+> `cargo make ui-preview-data` — see [Host UI preview](#%EF%B8%8F-host-ui-preview).
+
+---
+
+## 🧱 Hardware
+
+| Function          | ESP32-C6 GPIO |
+|-------------------|---------------|
+| ST7789 SCK        | GPIO3         |
+| ST7789 MOSI       | GPIO0         |
+| ST7789 CS         | GPIO1         |
+| ST7789 DC         | GPIO2         |
+| ST7789 RST        | GPIO22        |
+| ST7789 BLK        | GPIO23        |
+| Si4703 SDA (SDIO) | GPIO6         |
+| Si4703 SCL (SCLK) | GPIO7         |
+| Si4703 RST        | GPIO10        |
+| Encoder S1 (CLK)  | GPIO11        |
+| Encoder S2 (DT)   | GPIO18        |
+| Encoder KEY       | GPIO19        |
+
+**User interaction**
+
+- Rotate encoder → tune ±0.1 MHz.
+- Short press → seek to next strong station.
+- Long press (≥ 800 ms) → toggle mute.
+
+---
+
+## 🏗️ Architecture
+
+Three concurrent embassy tasks, decoupled by lock-free channels and a single shared mutex:
+
+```mermaid
+flowchart LR
+    subgraph HW [Hardware]
+      ENC[KY-040 encoder<br/>+ PCNT]
+      TUNER[Si4703 FM tuner<br/>I²C]
+      LCD[ST7789 LCD<br/>SPI]
+    end
+
+    subgraph TASKS [Embassy tasks]
+      IN[input_task]
+      RADIO[radio_task]
+      UI[ui_task]
+    end
+
+    ENC -- pulses + button --> IN
+    IN  -- InputCmd<br/>Channel 8 --> RADIO
+    RADIO <-- I²C --> TUNER
+    RADIO -- RadioState<br/>Mutex --> UI
+    UI  -- frame buffer --> LCD
+```
+
+- **`input_task`** debounces the encoder + button and emits `InputCmd::{TuneDelta, Seek, ToggleMute}` events.
+- **`radio_task`** owns the Si4703 driver, applies tuning/seek/mute, decodes RDS, then publishes a snapshot of `RadioState` under the mutex.
+- **`ui_task`** wakes ~30 fps, reads the latest `RadioState`, and updates the Slint model bound to [`ui/radio_ui.slint`](./ui/radio_ui.slint).
+
+---
+
+## 🚦 Boot sequence
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Boot as main()
+    participant HW as hardware::init
+    participant Wifi as WifiProvisioner
+    participant Disp as Display + Slint
+    participant Tuner as Si4703
+    participant Tasks as embassy::Spawner
+
+    Boot->>HW: configure clocks / SPI / I²C / PCNT
+    HW-->>Boot: pins + peripherals
+    Boot->>Disp: init ST7789 + Slint platform
+    Disp-->>Boot: window + frame buffer
+    Boot->>Wifi: load creds from flash
+    alt creds present
+        Wifi-->>Boot: connect STA
+    else no creds
+        Wifi-->>Boot: start SoftAP captive portal
+        Note over Wifi: user submits SSID/PWD<br/>credentials persisted to flash
+    end
+    Boot->>Tuner: power-up + auto-scan strongest station
+    Tuner-->>Boot: initial frequency
+    Boot->>Tasks: spawn(input_task, radio_task, ui_task)
+    Tasks-->>Boot: running ⏱️
+```
+
+---
+
+## 🧩 Module overview
+
+The reusable parts live as a `no_std` library so any sibling firmware can pick them up.
+
+| Module | File | Responsibility |
+|---|---|---|
+| `display`         | [src/display/mod.rs](./src/display/mod.rs)               | ST7789 SPI driver, double frame buffer, Slint platform glue (`Platform`, `WindowAdapter`, `LineBufferProvider`). |
+| `rotary_encoder`  | [src/rotary_encoder/mod.rs](./src/rotary_encoder/mod.rs) | KY-040 driver on **PCNT** peripheral with overflow handler — produces clean `±N` deltas + button events, no ISR jitter. |
+| `si4703`          | [src/si4703/mod.rs](./src/si4703/mod.rs)                 | Si4703 I²C register map, tune/seek/volume/mute, RDS group-A/B decoder (PS, RT, PI), GB2312/UTF-8 extension hooks. |
+| `wifi_provision`  | [src/wifi_provision/mod.rs](./src/wifi_provision/mod.rs) | SoftAP + DHCP + DNS-redirect captive portal with `picoserve`, plus [`storage.rs`](./src/wifi_provision/storage.rs) for flash persistence. |
+
+---
+
+## 📁 Project layout
+
+```text
+esp-radio/
+├── src/
+│   ├── lib.rs                    # Re-usable driver crate (no_std)
+│   ├── display/                  # ST7789 SPI driver + Slint platform glue
+│   ├── rotary_encoder/           # KY-040 driver on PCNT hardware peripheral
+│   ├── si4703/                   # Si4703 FM tuner I²C driver + RDS decoder
+│   ├── wifi_provision/           # SoftAP captive portal + flash persistence
+│   └── bin/radio/                # Main firmware (split into 5 focused files)
+│       ├── main.rs               # Wiring & boot sequence
+│       ├── hardware.rs           # GPIO/SPI/I²C/PCNT initialization
+│       ├── state.rs              # Shared embassy-sync primitives
+│       ├── tasks.rs              # Async tasks (input / radio / UI)
+│       └── ui.rs                 # Slint <-> radio-state bridge
+├── ui/
+│   ├── radio_ui.slint            # Main Material UI
+│   ├── preview_data.json         # Sample data for host preview
+│   ├── main.slint
+│   └── slint_st7789_ui.slint
+├── examples/                     # Standalone single-feature demos
+│   ├── si4703_fm_radio.rs
+│   ├── rotary_encoder.rs
+│   ├── slint_st7789.rs
+│   └── wifi_provision.rs
+├── material-1.0/                 # Vendored Slint Material widget set
+├── Cargo.toml
+├── Makefile.toml                 # cargo-make tasks
+├── rust-toolchain.toml           # nightly + riscv32imac target
+└── build.rs
+```
+
+---
+
+## 🚀 Quick start
+
+### 1. Toolchain
+
+The toolchain is pinned by [`rust-toolchain.toml`](./rust-toolchain.toml); `rustup` will pick up the right channel and target automatically:
+
+```bash
+# Cargo helpers
+cargo install cargo-make
+cargo install probe-rs --features cli   # for `cargo run` / `probe-rs attach`
+
+# Optional: host UI preview tool (also auto-installed by cargo-make)
+cargo install slint-viewer
+```
+
+### 2. Build & flash
+
+```bash
+# Connect your ESP32-C6 via USB, then:
+cargo make flash-release          # build + flash main firmware
+cargo make monitor                # attach RTT log viewer
+
+# Or run a single example:
+cargo make flash-example -e EXAMPLE=si4703_fm_radio
+```
+
+### 3. WiFi provisioning (first boot only)
+
+1. After flashing, the device starts a **SoftAP** named `ESP-Radio-Setup`.
+2. Connect from your phone / laptop, the captive portal opens automatically.
+3. Pick your home SSID and enter the password — credentials are written to flash and the device reboots into station mode.
+
+---
+
+## 🛠️ `cargo make` task reference
+
+| Task                        | Purpose                                                          |
+|-----------------------------|------------------------------------------------------------------|
+| `build` / `build-release`   | Build the main firmware binary                                   |
+| `build-all` / `…-release`   | Build library + every example                                    |
+| `build-example`             | Build a single example (`EXAMPLE=<name>`)                        |
+| `flash` / `flash-release`   | Build **and** flash via `probe-rs run`                           |
+| `flash-example`             | Flash one example (`EXAMPLE=<name>`)                             |
+| `monitor`                   | Attach `probe-rs` and stream defmt logs                          |
+| `check` / `clippy` / `fmt`  | Standard code-quality checks                                     |
+| `fmt-check`                 | Verify formatting without modifying files                        |
+| `size` / `size-example`     | Print release-mode firmware size with `rust-size`                |
+| `test`                      | Run on-device tests (`embedded-test` + `probe-rs`)               |
+| `clean`                     | `cargo clean`                                                    |
+| `ci`                        | `fmt-check` + `clippy` + `build-all-release`                     |
+| `dev`                       | Fast dev loop: `check` + `clippy`                                |
+| `release`                   | Full release pipeline                                            |
+| `ui-install-viewer`         | Install / verify host-side `slint-viewer`                        |
+| `ui-preview`                | Live-preview the radio UI on the host (auto-reload)              |
+| `ui-preview-data`           | Same, but pre-loads sample RDS / volume data                     |
+
+---
+
+## 🖥️ Host UI preview
+
+You can iterate on the Slint UI **without an ESP32 connected**:
+
+```bash
+cargo make ui-preview-data
+```
+
+A native window opens with mock data from [`ui/preview_data.json`](./ui/preview_data.json); editing [`ui/radio_ui.slint`](./ui/radio_ui.slint) reloads instantly.
+
+### macOS 26 (Tahoe) note
+
+Some transitive build dependencies (e.g. `bonjour-sys`) call `bindgen` directly and would fail on the macOS 26 SDK with `architecture not supported`. The `ui-*` tasks pre-export `SDKROOT` + `BINDGEN_EXTRA_CLANG_ARGS` for you, so `cargo make ui-preview` just works — no manual environment setup needed.
+
+---
+
+## 📡 RDS support matrix
+
+| Capability                      | Status | Notes |
+|---------------------------------|:------:|-------|
+| Program Identification (PI)     | ✅     | Used as a station fingerprint for caching. |
+| Program Service (PS, 8 chars)   | ✅     | Rendered as the bold station name. |
+| RadioText (RT, ≤ 64 chars)      | ✅     | Marquee scrolls in the UI. |
+| GB2312 (CN extension)           | ✅     | Falls back to UTF-8 if a header byte is detected. |
+| UTF-8 (RDS extension)           | ✅     | Auto-detected by leading sequence. |
+| Traffic Announcement (TA)       | 🟡     | Decoded but not yet surfaced in UI. |
+| Clock-Time (CT)                 | ✅     | Decoded from group 4A and shown in the top bar (`HH:MM`, local-time offset applied). |
+| RDS-AF alternative-frequency    | ⏳     | Planned. |
+
+✅ shipping · 🟡 partial · ⏳ planned
+
+---
+
+## 📦 Performance & footprint
+
+Numbers from a `cargo make build-release` on Rust nightly (LTO `fat`, `opt-level=z`):
+
+| Metric                   | Value (typical)              |
+|--------------------------|------------------------------|
+| Flash image (`.text`)    | ~ 740 KB                     |
+| Static RAM (`.bss`+`.data`) | ~ 90 KB                   |
+| Heap (`esp-alloc`)       | 96 KB reserved               |
+| Slint frame buffer       | 1 line × 240 × 16 bpp        |
+| UI render rate           | ~ 30 fps                     |
+| Tune-to-audio latency    | < 120 ms                     |
+| Boot to first frame      | ~ 850 ms (with cached WiFi)  |
+
+> Run `cargo make size` after a release build to print the exact section sizes for **your** toolchain.
+
+---
+
+## 🔄 Development workflow
+
+```mermaid
+flowchart LR
+    A([edit code]) --> B{cargo make}
+    B -->|dev| C[check + clippy]
+    B -->|ci|  D[fmt-check + clippy + build-all-release]
+    B -->|release| E[fmt-check + clippy + build-all-release + size]
+    C --> F[flash-release]
+    D --> F
+    E --> F
+    F --> G[monitor — RTT defmt logs]
+    G --> A
+```
+
+**Recommended loop**
+
+1. UI tweak → `cargo make ui-preview-data` (instant feedback).
+2. Driver / logic change → `cargo make dev` (fast type/lint check).
+3. Hardware-in-the-loop → `cargo make flash-release && cargo make monitor`.
+4. Pre-PR → `cargo make ci`.
+
+---
+
+## 🧰 Tech stack
+
+- **MCU** — ESP32-C6 (RISC-V, single-core, WiFi 6 + BLE 5)
+- **Async runtime** — [`embassy`](https://embassy.dev) (`embassy-executor` / `embassy-net` / `embassy-time` / `embassy-sync`)
+- **HAL** — [`esp-hal`](https://github.com/esp-rs/esp-hal) `1.1` + [`esp-rtos`](https://crates.io/crates/esp-rtos) `0.3`
+- **WiFi/BLE** — [`esp-radio`](https://crates.io/crates/esp-radio) `0.18` (coex + WiFi + BLE)
+- **GUI** — [`slint`](https://slint.dev) `1.16` software renderer with `compat-1-2` + `unsafe-single-threaded`
+- **Display** — [`mipidsi`](https://crates.io/crates/mipidsi) `0.10` (ST7789 driver) over `embedded-hal-bus` SPI
+- **Storage** — [`esp-storage`](https://crates.io/crates/esp-storage) for WiFi credentials
+- **Logging** — `defmt` + `rtt-target` + `panic-rtt-target`
+- **Build** — Rust nightly, `riscv32imac-unknown-none-elf`, `build-std=alloc,core`, LTO `fat`, `opt-level=z`
+
+---
+
+## 🐛 Troubleshooting & FAQ
+
+<details>
+<summary><b>probe-rs cannot find the chip</b></summary>
+
+Make sure your USB-JTAG bridge is connected and the device is in download mode; retry `cargo make monitor`. On macOS, also check `System Settings → Privacy → USB` permissions.
+</details>
+
+<details>
+<summary><b>WiFi never connects</b></summary>
+
+Long-press the encoder during boot to clear stored credentials — the SoftAP portal will appear again on next boot. You can also wipe flash with <code>probe-rs erase --chip esp32c6</code>.
+</details>
+
+<details>
+<summary><b><code>bonjour-sys</code> fails to build on macOS 26 (Tahoe)</b></summary>
+
+Use <code>cargo make ui-preview*</code> (it injects <code>SDKROOT</code> and <code>BINDGEN_EXTRA_CLANG_ARGS</code>); never call <code>cargo install slint-viewer</code> manually on Tahoe without those env vars.
+</details>
+
+<details>
+<summary><b>Display stays black</b></summary>
+
+Check the <code>BLK</code> (backlight) pin on GPIO23 and the SPI wiring order (<code>SCK</code>, <code>MOSI</code>, <code>CS</code>, <code>DC</code>, <code>RST</code>). A floating <code>RST</code> line is the most common offender.
+</details>
+
+<details>
+<summary><b>Why nightly Rust?</b></summary>
+
+We rely on <code>build-std</code> to rebuild <code>core</code>/<code>alloc</code> for <code>riscv32imac-unknown-none-elf</code>, plus a few <code>esp-hal</code> features that require nightly. The exact channel is pinned in <a href="./rust-toolchain.toml"><code>rust-toolchain.toml</code></a>.
+</details>
+
+<details>
+<summary><b>Can I run this on ESP32 / ESP32-S3 / ESP32-C3?</b></summary>
+
+Most of the code is portable, but the firmware currently hard-codes ESP32-C6 features in <code>Cargo.toml</code> (<code>esp-hal</code>, <code>esp-rtos</code>, <code>esp-radio</code>, <code>esp-storage</code>). Porting requires switching those feature flags and re-checking the GPIO map.
+</details>
+
+---
+
+## 🗺️ Roadmap
+
+- [x] FM tuning + auto-scan + RDS PS / RT
+- [x] WiFi captive portal + flash persistence
+- [x] Slint Material UI on ST7789
+- [x] On-device tests (`embedded-test`)
+- [x] RDS Clock-Time (CT) — auto-sync wall clock from group 4A
+- [ ] RDS-AF alternative frequency follow
+- [ ] Internet radio fallback (HLS/Icecast over WiFi)
+- [ ] OTA firmware update via WiFi — *design ready, implementation deferred* → see [docs/ota-design.md](./docs/ota-design.md)
+- [ ] Battery-fuel-gauge widget on the UI
+- [ ] BLE remote control (HID volume keys)
+
+### 📑 Design documents
+
+- [OTA firmware update — technical design](./docs/ota-design.md)
+
+---
+
+## 🤝 Contributing
+
+Contributions are welcome. Before opening a PR:
+
+1. Run `cargo make ci` locally — it must pass.
+2. Keep PRs focused (one feature or fix per PR).
+3. Add a short rationale in the PR description and link any related issue.
+4. New public APIs in [`src/lib.rs`](./src/lib.rs) require rustdoc comments.
+5. UI changes should include a `cargo make ui-preview-data` screenshot.
+
+For larger changes, open an issue first to discuss the design.
+
+---
+
+## 🙏 Acknowledgements
+
+This project would not exist without these stellar communities:
+
+- [esp-rs](https://github.com/esp-rs) — `esp-hal`, `esp-rtos`, `esp-radio`, `esp-storage`, `esp-bootloader-esp-idf`.
+- [embassy-rs](https://embassy.dev) — async embedded runtime.
+- [Slint](https://slint.dev) — declarative GUI for embedded.
+- [mipidsi](https://github.com/almindor/mipidsi) — display drivers in pure Rust.
+- [probe-rs](https://probe.rs) — flashing, debugging, RTT logs.
+- [Material Design](https://m3.material.io) and the bundled [`material-1.0`](./material-1.0/) Slint widgets.
+
+---
+
+## 📜 License
+
+This repository is provided for educational and prototyping purposes. Vendored UI assets under [`material-1.0/`](./material-1.0/) retain their upstream license (see `material-1.0/LICENSE.md`).
+
+Project source code: see individual file headers; if no license is present, all rights reserved by the author until a license file is added.

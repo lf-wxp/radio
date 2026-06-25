@@ -1,0 +1,12 @@
+{
+  "freq-mhz-x10": 1015,
+  "rssi": 48,
+  "volume": 9,
+  "muted": false,
+  "station-name": "CRI Easy",
+  "radio-text": "Now playing: 测试中文 RDS 滚动文本 — Imagine by John Lennon · 101.5 MHz",
+  "clock-text": "19:42",
+  "wifi-connected": true,
+  "wifi-ssid": "MyHomeWiFi",
+  "status-text": "Tuned"
+}

@@ -1,0 +1,270 @@
+//! ESP-Radio: A complete FM radio application for ESP32-C6.
+//!
+//! This binary integrates all the project's modules into a single
+//! production-ready firmware:
+//!
+//! - **WiFi**: Provisioned via SoftAP captive portal, persisted in Flash
+//!   (see [`radio::wifi_provision`]).
+//! - **Display**: 240x320 ST7789 LCD over SPI rendering a Material-Design
+//!   Slint UI (see [`radio::display`] and `ui/radio_ui.slint`).
+//! - **Tuner**: Si4703 FM receiver over I2C with auto-tune to the
+//!   strongest station on boot (see [`radio::si4703`]).
+//! - **Input**: KY-040 rotary encoder for tuning + push button for seek
+//!   / mute (see [`radio::rotary_encoder`]).
+//!
+//! # Hardware connections (ESP32-C6)
+//!
+//! | Function          | GPIO   |
+//! |-------------------|--------|
+//! | ST7789 SCK        | GPIO3  |
+//! | ST7789 MOSI       | GPIO0  |
+//! | ST7789 CS         | GPIO1  |
+//! | ST7789 DC         | GPIO2  |
+//! | ST7789 RST        | GPIO22 |
+//! | ST7789 BLK        | GPIO23 |
+//! | Si4703 SDA (SDIO) | GPIO6  |
+//! | Si4703 SCL (SCLK) | GPIO7  |
+//! | Si4703 RST        | GPIO10 |
+//! | Encoder S1 (CLK)  | GPIO11 |
+//! | Encoder S2 (DT)   | GPIO18 |
+//! | Encoder KEY       | GPIO19 |
+//!
+//! # User interaction
+//!
+//! - **Rotate encoder**: tune up/down by 0.1 MHz steps.
+//! - **Short press button**: seek to next strong station.
+//! - **Long press button (>= 800 ms)**: toggle mute.
+//!
+//! # Architecture
+//!
+//! State is shared across three concurrent activities via `embassy-sync`
+//! primitives:
+//!
+//! - [`state::INPUT_CMDS`] (Channel<8>): input task -> radio control task.
+//! - [`state::RADIO_STATE`] (Mutex): radio control task -> UI render loop.
+
+#![no_std]
+#![no_main]
+#![deny(
+  clippy::mem_forget,
+  reason = "mem::forget is generally not safe to do with esp_hal types, especially those \
+    holding buffers for the duration of a data transfer."
+)]
+#![deny(clippy::large_stack_frames)]
+
+extern crate alloc;
+
+mod hardware;
+mod state;
+mod tasks;
+mod ui;
+
+use defmt::info;
+use embassy_executor::Spawner;
+use embassy_net::StackResources;
+use embassy_time::{Duration, Timer};
+use esp_hal::clock::CpuClock;
+use esp_hal::pcnt::Pcnt;
+use esp_hal::timer::timg::TimerGroup;
+use esp_storage::FlashStorage;
+use panic_rtt_target as _;
+use static_cell::StaticCell;
+
+use radio::rotary_encoder::handle_pcnt_overflow;
+use radio::si4703::{Station, format_freq};
+use radio::wifi_provision::{ConnectionConfig, ProvisioningConfig, WifiProvisioner};
+
+use crate::hardware::{DisplayPins, EncoderPins, TunerPins};
+use crate::state::{
+  DEFAULT_FREQ_X10, MAX_SCAN_STATIONS, RADIO_STATE, pick_strongest, publish_freq, set_status,
+};
+
+slint::include_modules!();
+
+esp_bootloader_esp_idf::esp_app_desc!();
+
+/// Static storage for the embassy-net stack resources.
+static STACK_RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
+
+/// PCNT interrupt handler for rotary-encoder overflow accumulation.
+///
+/// Must live in `main.rs` because the `#[esp_hal::handler]` attribute
+/// macro requires a top-level binary `fn`.
+#[esp_hal::handler]
+fn pcnt_interrupt_handler() {
+  handle_pcnt_overflow(0, 100, -100);
+}
+
+#[allow(
+  clippy::large_stack_frames,
+  reason = "main allocates large peripheral wrappers and SPI/UI buffers"
+)]
+#[esp_rtos::main]
+async fn main(spawner: Spawner) -> ! {
+  rtt_target::rtt_init_defmt!();
+  info!("=== ESP-Radio: starting ===");
+
+  // ------------------------------------------------------------------------
+  // Core init: clocks, allocator, embassy
+  // ------------------------------------------------------------------------
+  let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
+  let peripherals = esp_hal::init(config);
+
+  // Two heap regions are registered with esp-alloc; both feed a single
+  // global allocator and dispatch is handled by esp-alloc internally.
+  //   1. 64 KiB in *reclaimed* RAM (e.g. boot stack region freed after
+  //      `esp_hal::init`). Available immediately and best for transient
+  //      buffers.
+  //   2. 96 KiB in regular DRAM, used by Slint, WiFi/BLE, and Rust
+  //      `String`/`Vec` allocations.
+  // Total = 160 KiB. Adjust if `oom` panics appear during heavy WiFi
+  // load or large Slint scenes.
+  esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 65536);
+  esp_alloc::heap_allocator!(size: 96 * 1024);
+
+  let timg0 = TimerGroup::new(peripherals.TIMG0);
+  let sw_interrupt =
+    esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+  esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
+  info!("Embassy initialized");
+
+  // ------------------------------------------------------------------------
+  // Display + Slint platform
+  // ------------------------------------------------------------------------
+  let display_bundle = hardware::init_display(
+    peripherals.SPI2,
+    DisplayPins {
+      sck: peripherals.GPIO3,
+      mosi: peripherals.GPIO0,
+      cs: peripherals.GPIO1,
+      dc: peripherals.GPIO2,
+      rst: peripherals.GPIO22,
+      blk: peripherals.GPIO23,
+    },
+  );
+  let mut display = display_bundle.display;
+  let window = display_bundle.window;
+  info!("ST7789 ready");
+
+  let ui_root = RadioWindow::new().expect("create UI failed");
+  let ui_weak = ui_root.as_weak();
+  set_status("Connecting WiFi...").await;
+  ui::render_once(&window, &ui_root, &mut display).await;
+
+  // ------------------------------------------------------------------------
+  // WiFi provisioning + connection
+  // ------------------------------------------------------------------------
+  let flash = FlashStorage::new(peripherals.FLASH);
+  let mut provisioner = WifiProvisioner::new(flash);
+  let conn_config = ConnectionConfig::default();
+  let prov_config = ProvisioningConfig::default();
+  let stack_resources = STACK_RESOURCES.init(StackResources::new());
+
+  match provisioner
+    .provision_and_connect(
+      &spawner,
+      peripherals.WIFI,
+      &conn_config,
+      &prov_config,
+      stack_resources,
+    )
+    .await
+  {
+    Ok(connected) => {
+      info!("WiFi connected: {}", connected.ssid.as_str());
+      let mut state = RADIO_STATE.lock().await;
+      state.wifi_connected = true;
+      state.wifi_ssid = connected.ssid.clone();
+      state.status = "WiFi OK";
+      state.dirty = true;
+      drop(state);
+      // We intentionally drop `connected` here: the embassy-net stack and
+      // controller continue running through the spawned task. Future
+      // features (NTP, internet radio) can take ownership of the stack
+      // before that.
+      drop(connected);
+    }
+    Err(e) => {
+      info!("WiFi failed: {} - continuing offline", e);
+      let mut state = RADIO_STATE.lock().await;
+      state.wifi_connected = false;
+      state.status = "WiFi failed";
+      state.dirty = true;
+    }
+  }
+
+  // ------------------------------------------------------------------------
+  // Si4703 FM tuner init
+  // ------------------------------------------------------------------------
+  set_status("Init tuner...").await;
+  let (mut radio_chip, mut i2c) = hardware::init_tuner(
+    peripherals.I2C0,
+    TunerPins {
+      sda: peripherals.GPIO6,
+      scl: peripherals.GPIO7,
+      rst: peripherals.GPIO10,
+    },
+  )
+  .await;
+  info!("I2C ready");
+
+  if radio_chip.init(&mut i2c).await.is_err() {
+    info!("ERROR: Si4703 init failed - check wiring");
+    set_status("Tuner err!").await;
+    // Keep the UI loop alive so the user can see the error.
+    // `run_loop` returns `!`, so this path never falls through.
+    ui::run_loop(&window, &mut display, &ui_weak).await
+  }
+  info!(
+    "Si4703 ready (dev=0x{:04X}, chip=0x{:04X})",
+    radio_chip.device_id(),
+    radio_chip.chip_id()
+  );
+  let _ = radio_chip.set_volume(&mut i2c, 8);
+
+  // ------------------------------------------------------------------------
+  // Boot-time scan: pick the strongest station to start with
+  // ------------------------------------------------------------------------
+  set_status("Scanning...").await;
+  ui::render_once(&window, &ui_root, &mut display).await;
+
+  let mut stations = [Station::empty(); MAX_SCAN_STATIONS];
+  let initial_freq = match radio_chip.scan_stations(&mut i2c, &mut stations).await {
+    Ok(count) if count > 0 => pick_strongest(&stations[..count]).unwrap_or(DEFAULT_FREQ_X10),
+    _ => DEFAULT_FREQ_X10,
+  };
+  let (mhz, dec) = format_freq(initial_freq);
+  info!("Tuning to {}.{} MHz", mhz, dec);
+  let _ = radio_chip.tune(&mut i2c, initial_freq).await;
+  publish_freq(initial_freq).await;
+  set_status("Ready").await;
+
+  // ------------------------------------------------------------------------
+  // Rotary encoder init (PCNT0)
+  // ------------------------------------------------------------------------
+  let mut pcnt = Pcnt::new(peripherals.PCNT);
+  pcnt.set_interrupt_handler(pcnt_interrupt_handler);
+
+  let encoder = hardware::init_encoder(
+    pcnt,
+    EncoderPins {
+      a: peripherals.GPIO11,
+      b: peripherals.GPIO18,
+      key: peripherals.GPIO19,
+    },
+  );
+  info!("Rotary encoder ready");
+
+  // ------------------------------------------------------------------------
+  // Spawn input + radio control tasks; render UI in main
+  // ------------------------------------------------------------------------
+  spawner.spawn(tasks::input_task(encoder).expect("create input_task token"));
+  spawner
+    .spawn(tasks::radio_control_task(radio_chip, i2c).expect("create radio_control_task token"));
+
+  // Tiny pause to let tasks initialise before we monopolise the executor.
+  Timer::after(Duration::from_millis(10)).await;
+
+  info!("All systems running. Entering UI render loop.");
+  ui::run_loop(&window, &mut display, &ui_weak).await
+}

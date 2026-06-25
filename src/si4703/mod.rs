@@ -34,6 +34,10 @@
 //! // radio.tune(&mut i2c, 1015).await.unwrap(); // 101.5 MHz
 //! ```
 
+extern crate alloc;
+
+use alloc::string::String;
+
 use embassy_time::{Duration, Timer};
 
 // ============================================================================
@@ -376,7 +380,13 @@ impl Si4703 {
     self.write_registers(i2c)?;
 
     // Wait for Seek/Tune Complete (STC) flag
-    self.wait_stc(i2c).await?;
+    let stc_ok = self.wait_stc(i2c).await?;
+    if !stc_ok {
+      defmt::warn!(
+        "tune: STC timeout, frequency {} may not be tuned successfully",
+        freq_mhz_x10
+      );
+    }
 
     // Clear TUNE bit
     self.read_registers(i2c)?;
@@ -436,10 +446,10 @@ impl Si4703 {
     self.write_registers(i2c)?;
 
     // Wait for STC
-    self.wait_stc(i2c).await?;
+    let stc_ok = self.wait_stc(i2c).await?;
 
-    // Check if seek failed (SF/BL bit)
-    let seek_failed = (self.regs[REG_STATUS_RSSI] & STATUS_SF_BL) != 0;
+    // Check if seek failed (SF/BL bit) or timed out
+    let seek_failed = !stc_ok || (self.regs[REG_STATUS_RSSI] & STATUS_SF_BL) != 0;
 
     // Clear SEEK bit
     self.regs[REG_POWER_CFG] &= !PWR_SEEK;
@@ -583,8 +593,11 @@ impl Si4703 {
     i2c.write(SI4703_ADDR, &buf)
   }
 
-  /// Wait for Seek/Tune Complete (STC) flag with timeout (5 seconds)
-  async fn wait_stc<I2C>(&mut self, i2c: &mut I2C) -> Result<(), I2C::Error>
+  /// Wait for Seek/Tune Complete (STC) flag with timeout (5 seconds).
+  ///
+  /// Returns `Ok(true)` if STC was set within the timeout,
+  /// `Ok(false)` if the operation timed out without STC being set.
+  async fn wait_stc<I2C>(&mut self, i2c: &mut I2C) -> Result<bool, I2C::Error>
   where
     I2C: embedded_hal::i2c::I2c,
   {
@@ -592,11 +605,12 @@ impl Si4703 {
       Timer::after(Duration::from_millis(50)).await;
       self.read_registers(i2c)?;
       if (self.regs[REG_STATUS_RSSI] & STATUS_STC) != 0 {
-        return Ok(());
+        return Ok(true);
       }
     }
-    // Timeout - return anyway
-    Ok(())
+    // Timeout: STC flag was not set within 5 seconds
+    defmt::warn!("wait_stc: STC timeout (5s)");
+    Ok(false)
   }
 }
 
@@ -604,15 +618,79 @@ impl Si4703 {
 // RDS Decoder
 // ============================================================================
 
-/// Simple RDS (Radio Data System) decoder.
+/// Maximum number of bytes a Group 2A RadioText message can carry
+/// (16 segments * 4 bytes = 64). Group 2B is shorter (32) but fits the
+/// same buffer.
+pub const RT_MAX_LEN: usize = 64;
+
+/// Decoded RDS Clock-Time payload (Group 4A).
 ///
-/// Currently supports decoding the Programme Service (PS) name,
-/// which is the 8-character station name broadcast by FM stations.
+/// The wire protocol carries UTC hour/minute together with a *local*
+/// timezone offset measured in half-hours (so e.g. China = `+16` →
+/// UTC+8h). The MJD (Modified Julian Date) part is intentionally not
+/// surfaced here: the UI only displays `HH:MM`, and skipping the date
+/// math keeps this MCU-friendly.
+#[derive(Clone, Copy, Debug, defmt::Format, PartialEq, Eq)]
+pub struct RdsClockTime {
+  /// UTC hour, range `0..=23`.
+  pub utc_hour: u8,
+  /// UTC minute, range `0..=59`.
+  pub utc_minute: u8,
+  /// Local-time offset in half-hours, range `-24..=24`
+  /// (sign bit + 5-bit magnitude as transmitted).
+  pub local_offset_half_hours: i8,
+}
+
+impl RdsClockTime {
+  /// Return the local hour after applying [`local_offset_half_hours`],
+  /// wrapped into `0..24`. Minutes are also returned because a 30-minute
+  /// offset (e.g. India `+11`, Newfoundland `-7`) can roll the minute
+  /// component into the next hour.
+  pub fn local_hh_mm(self) -> (u8, u8) {
+    // Convert UTC time + half-hour offset to total minutes since midnight,
+    // then wrap into a single day. Doing the math in i32 avoids any
+    // overflow/underflow when the offset is negative.
+    let utc_minutes = i32::from(self.utc_hour) * 60 + i32::from(self.utc_minute);
+    let offset_minutes = i32::from(self.local_offset_half_hours) * 30;
+    let total = (utc_minutes + offset_minutes).rem_euclid(24 * 60);
+    ((total / 60) as u8, (total % 60) as u8)
+  }
+}
+
+/// RDS (Radio Data System) decoder for PS (station name) and RT (Radio Text).
+///
+/// Supports:
+/// - Programme Service name (Group 0A/0B): 8-character station name
+/// - RadioText (Group 2A/2B): up to 64 chars of free-form text broadcast by
+///   the station, terminated by `0x0D`. The decoder maintains a stable
+///   `radio_text` buffer that is only swapped when the broadcaster flips the
+///   A/B flag (signalling a new message).
+///
+/// The decoder does **not** convert character sets — it simply collects raw
+/// RDS bytes. Callers should run [`decode_rds_text`] on the resulting slice
+/// to produce a `String` suitable for display (handles UTF-8 / GB2312 / Latin-1).
 pub struct RdsDecoder {
   /// Programme Service name (8 characters)
   ps_name: [u8; 8],
   /// Bitmask of which PS segments have been received
   ps_valid: u8,
+
+  /// RadioText buffer (raw RDS bytes, terminator `0x0D` excluded).
+  rt_buf: [u8; RT_MAX_LEN],
+  /// Effective length of `rt_buf` (truncated at terminator or fully filled).
+  rt_len: usize,
+  /// Bitmask of which RT segments have been received (max 16 segments).
+  rt_valid: u32,
+  /// Most recently observed A/B flag; `None` until first RT group seen.
+  rt_ab_flag: Option<bool>,
+  /// True once the RT message has been observed in full (terminator seen or
+  /// all 16 segments collected).
+  rt_complete: bool,
+
+  /// Most recently decoded Clock-Time frame, awaiting consumption via
+  /// [`RdsDecoder::take_clock_time`]. `None` until the first valid 4A
+  /// group is decoded after construction or [`RdsDecoder::reset`].
+  ct_pending: Option<RdsClockTime>,
 }
 
 impl RdsDecoder {
@@ -621,6 +699,12 @@ impl RdsDecoder {
     Self {
       ps_name: [b' '; 8],
       ps_valid: 0,
+      rt_buf: [b' '; RT_MAX_LEN],
+      rt_len: 0,
+      rt_valid: 0,
+      rt_ab_flag: None,
+      rt_complete: false,
+      ct_pending: None,
     }
   }
 
@@ -628,20 +712,93 @@ impl RdsDecoder {
   ///
   /// Feed the four RDS blocks obtained from [`Si4703::read_rds`] into this method.
   /// Returns `true` if the PS (station) name is now complete.
-  pub fn process(&mut self, _block_a: u16, block_b: u16, _block_c: u16, block_d: u16) -> bool {
-    // Group type is in bits 15-12 of block B
+  pub fn process(&mut self, _block_a: u16, block_b: u16, block_c: u16, block_d: u16) -> bool {
+    // Group type is in bits 15-12 of block B; bit 11 is the version (0 = A, 1 = B)
     let group_type = (block_b >> 12) & 0x0F;
+    let version_b = (block_b & 0x0800) != 0;
 
-    // Group 0A/0B contains Programme Service name
-    if group_type == 0 {
-      let segment = (block_b & 0x03) as usize;
-      self.ps_name[segment * 2] = (block_d >> 8) as u8;
-      self.ps_name[segment * 2 + 1] = (block_d & 0xFF) as u8;
-      self.ps_valid |= 1 << segment;
+    match group_type {
+      // Group 0A / 0B: Programme Service name (always 4 chars * 2 bytes)
+      0 => {
+        let segment = (block_b & 0x03) as usize;
+        self.ps_name[segment * 2] = (block_d >> 8) as u8;
+        self.ps_name[segment * 2 + 1] = (block_d & 0xFF) as u8;
+        self.ps_valid |= 1 << segment;
+      }
+      // Group 2A / 2B: RadioText
+      2 => self.process_rt(block_b, block_c, block_d, version_b),
+      // Group 4A: Clock-Time (Group 4B is reserved by the spec).
+      4 if !version_b => self.process_ct(block_b, block_c, block_d),
+      _ => {}
     }
 
-    // All 4 segments received
+    // All 4 PS segments received
     self.ps_valid == 0x0F
+  }
+
+  /// Internal RT decode (Group 2A: 4 chars/segment, Group 2B: 2 chars/segment).
+  fn process_rt(&mut self, block_b: u16, block_c: u16, block_d: u16, version_b: bool) {
+    // Bit 4 of block B is the Text A/B flag — when it toggles, the
+    // broadcaster has started transmitting a new RT message.
+    let ab = (block_b & 0x0010) != 0;
+    if self.rt_ab_flag != Some(ab) {
+      self.rt_buf = [b' '; RT_MAX_LEN];
+      self.rt_len = 0;
+      self.rt_valid = 0;
+      self.rt_complete = false;
+      self.rt_ab_flag = Some(ab);
+    }
+
+    let segment = (block_b & 0x0F) as usize;
+    let bytes_per_segment = if version_b { 2 } else { 4 };
+    let base = segment * bytes_per_segment;
+    if base + bytes_per_segment > RT_MAX_LEN {
+      return;
+    }
+
+    let chars = if version_b {
+      // Group 2B: only block D carries 2 chars; block C is repeat of PI.
+      [(block_d >> 8) as u8, (block_d & 0xFF) as u8, 0, 0]
+    } else {
+      [
+        (block_c >> 8) as u8,
+        (block_c & 0xFF) as u8,
+        (block_d >> 8) as u8,
+        (block_d & 0xFF) as u8,
+      ]
+    };
+
+    let mut terminator_at: Option<usize> = None;
+    for (i, &byte) in chars.iter().take(bytes_per_segment).enumerate() {
+      // 0x0D ('\r') terminates the RT message early.
+      if byte == 0x0D {
+        terminator_at = Some(base + i);
+        break;
+      }
+      self.rt_buf[base + i] = byte;
+    }
+
+    self.rt_valid |= 1 << segment;
+
+    if let Some(end) = terminator_at {
+      self.rt_len = end;
+      self.rt_complete = true;
+      // Clear bytes past the terminator so they don't leak into the output.
+      for slot in &mut self.rt_buf[end..] {
+        *slot = b' ';
+      }
+    } else {
+      // Track the rightmost byte we've populated.
+      let candidate = base + bytes_per_segment;
+      if candidate > self.rt_len {
+        self.rt_len = candidate;
+      }
+      // Mark as complete when all theoretically-available segments are in.
+      let all_segments_mask = if version_b { 0x00FF } else { 0xFFFF };
+      if self.rt_valid == all_segments_mask {
+        self.rt_complete = true;
+      }
+    }
   }
 
   /// Get the decoded station name bytes (may be incomplete).
@@ -656,6 +813,33 @@ impl RdsDecoder {
     core::str::from_utf8(&self.ps_name).unwrap_or("        ")
   }
 
+  /// Get the station name decoded into a heap [`String`], handling
+  /// UTF-8 / GB2312 / Latin-1 input. See [`decode_rds_text`].
+  pub fn station_name_string(&self) -> String {
+    decode_rds_text(&self.ps_name)
+  }
+
+  /// Get the raw RadioText bytes received so far (length = [`Self::radio_text_len`]).
+  pub fn radio_text_bytes(&self) -> &[u8] {
+    &self.rt_buf[..self.rt_len]
+  }
+
+  /// Length in bytes of the RT message accumulated so far.
+  pub fn radio_text_len(&self) -> usize {
+    self.rt_len
+  }
+
+  /// Decode RadioText into a heap [`String`], handling UTF-8 / GB2312 / Latin-1.
+  pub fn radio_text_string(&self) -> String {
+    decode_rds_text(self.radio_text_bytes())
+  }
+
+  /// True once the RT message terminator (`0x0D`) has been observed or all
+  /// 16 segments have been received.
+  pub fn radio_text_complete(&self) -> bool {
+    self.rt_complete
+  }
+
   /// Check if the station name is complete (all 4 segments received)
   pub fn is_complete(&self) -> bool {
     self.ps_valid == 0x0F
@@ -667,6 +851,55 @@ impl RdsDecoder {
   pub fn reset(&mut self) {
     self.ps_name = [b' '; 8];
     self.ps_valid = 0;
+    self.rt_buf = [b' '; RT_MAX_LEN];
+    self.rt_len = 0;
+    self.rt_valid = 0;
+    self.rt_ab_flag = None;
+    self.rt_complete = false;
+    self.ct_pending = None;
+  }
+
+  /// Internal Clock-Time decode (Group 4A).
+  ///
+  /// Wire format (per RBDS Annex G / IEC 62106):
+  /// - Block B (low 2 bits) + Block C (high 15 bits) = 17-bit MJD (unused).
+  /// - Block C low 1 bit + Block D bits 15..12 = 5-bit UTC hour (0..=23).
+  /// - Block D bits 11..6 = 6-bit UTC minute (0..=59).
+  /// - Block D bit 5 = sign of local-time offset (1 = negative).
+  /// - Block D bits 4..0 = magnitude of local-time offset in half-hours.
+  ///
+  /// Out-of-range fields (e.g. hour=27 from a corrupted frame) are
+  /// silently dropped — the next valid CT will overwrite the stash.
+  fn process_ct(&mut self, _block_b: u16, block_c: u16, block_d: u16) {
+    let hour = (((block_c & 0x0001) << 4) | (block_d >> 12)) as u8;
+    let minute = ((block_d >> 6) & 0x3F) as u8;
+    let offset_mag = (block_d & 0x1F) as i8;
+    let sign_negative = (block_d & 0x0020) != 0;
+    let offset = if sign_negative {
+      -offset_mag
+    } else {
+      offset_mag
+    };
+
+    // Spec-mandated ranges; reject obvious corruption rather than show
+    // a bogus clock to the user.
+    if hour > 23 || minute > 59 || offset_mag > 24 {
+      return;
+    }
+
+    self.ct_pending = Some(RdsClockTime {
+      utc_hour: hour,
+      utc_minute: minute,
+      local_offset_half_hours: offset,
+    });
+  }
+
+  /// Take the most recently decoded Clock-Time frame, if any.
+  ///
+  /// Consumed on read so callers see each broadcast CT (which arrives
+  /// approximately once per minute, on the minute boundary) exactly once.
+  pub fn take_clock_time(&mut self) -> Option<RdsClockTime> {
+    self.ct_pending.take()
   }
 }
 
@@ -689,4 +922,86 @@ impl Default for RdsDecoder {
 /// ```
 pub fn format_freq(freq_mhz_x10: u16) -> (u16, u16) {
   (freq_mhz_x10 / 10, freq_mhz_x10 % 10)
+}
+
+// ============================================================================
+// RDS text decoding (UTF-8 / GB2312 / Latin-1)
+// ============================================================================
+
+/// Decode raw RDS bytes into a printable [`String`].
+///
+/// FM RDS broadcasters use one of three character encodings in practice:
+/// - **UTF-8** (modern stations, especially outside Europe).
+/// - **GB2312 / GBK** (Chinese stations using the RBDS Chinese extension).
+/// - **Latin-1 / ASCII** (default RDS character set, EBU Tech 3667).
+///
+/// The wire protocol does not signal which encoding is in use, so we apply
+/// a small heuristic:
+///
+/// 1. If the entire byte slice is valid UTF-8, decode it as such.
+/// 2. Otherwise scan byte-by-byte: if a byte falls in the GB2312 lead range
+///    (`0xA1..=0xFE`) and the next byte is a valid trail byte, treat the
+///    pair as a single CJK glyph and emit a placeholder `?` (we can't ship
+///    a 7000-entry GB2312 table on a 320 KB MCU). All other bytes outside
+///    the printable ASCII range (`0x20..=0x7E`) are also emitted as `?`.
+///
+/// Trailing whitespace (spaces and `0x00`) is stripped so the UI doesn't
+/// show a half-empty buffer when the message is shorter than the maximum.
+///
+/// This means:
+/// - English / European stations render correctly verbatim.
+/// - Chinese stations show one `?` per CJK character (UI still scrolls a
+///   meaningful length so the user knows RT is present).
+/// - UTF-8 stations (including emoji) render correctly.
+pub fn decode_rds_text(bytes: &[u8]) -> String {
+  // Strip trailing 0x00 / space padding before decoding so UTF-8 detection
+  // and length tracking aren't fooled by buffer-fill bytes.
+  let mut end = bytes.len();
+  while end > 0 {
+    let last = bytes[end - 1];
+    if last == b' ' || last == 0 {
+      end -= 1;
+    } else {
+      break;
+    }
+  }
+  let trimmed = &bytes[..end];
+
+  if trimmed.is_empty() {
+    return String::new();
+  }
+
+  // Fast path: pure ASCII or valid UTF-8 (covers UTF-8 RDS extensions).
+  if let Ok(s) = core::str::from_utf8(trimmed) {
+    return String::from(s);
+  }
+
+  // Fallback: scan byte-by-byte, recognising GB2312 lead/trail pairs.
+  let mut out = String::with_capacity(trimmed.len());
+  let mut i = 0;
+  while i < trimmed.len() {
+    let byte = trimmed[i];
+    if (0x20..=0x7E).contains(&byte) {
+      // Printable ASCII passes through.
+      out.push(byte as char);
+      i += 1;
+    } else if (0xA1..=0xFE).contains(&byte) && i + 1 < trimmed.len() {
+      // Looks like a GB2312 lead byte. Validate the trail byte.
+      let trail = trimmed[i + 1];
+      let is_valid_gb_trail =
+        (0xA1..=0xFE).contains(&trail) || (0x40..=0x7E).contains(&trail) || trail == 0x80;
+      if is_valid_gb_trail {
+        out.push('?');
+        i += 2;
+        continue;
+      }
+      out.push('?');
+      i += 1;
+    } else {
+      // Anything else (control chars, isolated high bytes) -> placeholder.
+      out.push('?');
+      i += 1;
+    }
+  }
+  out
 }

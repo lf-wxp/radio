@@ -2,6 +2,7 @@
     "words": [
         "AFCRL",
         "AHIZEN",
+        "bindgen",
         "codegen",
         "coex",
         "creds",
@@ -13,8 +14,11 @@
         "HDLC",
         "heapless",
         "imac",
+        "initialisation",
+        "Initialise",
         "libm",
         "linkall",
+        "materialises",
         "mipidsi",
         "MOSI",
         "MSVC",
@@ -33,6 +37,7 @@
         "rustflags",
         "sclk",
         "SDIO",
+        "SDKROOT",
         "SEEKTH",
         "SEEKUP",
         "SKCNT",
@@ -47,6 +52,7 @@
         "Tlinkall",
         "unmute",
         "wroom",
+        "xcrun",
         "XOSCEN"
     ]
 }

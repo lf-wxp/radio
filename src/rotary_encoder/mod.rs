@@ -139,14 +139,17 @@ static OVERFLOW_UNIT2: AtomicI32 = AtomicI32::new(0);
 /// Overflow accumulator for PCNT Unit3
 static OVERFLOW_UNIT3: AtomicI32 = AtomicI32::new(0);
 
-/// Get reference to overflow accumulator for specified PCNT unit
+/// Get reference to overflow accumulator for specified PCNT unit.
+///
+/// # Panics
+/// Panics if `unit` is not in the range 0..=3.
 fn overflow_atomic(unit: usize) -> &'static AtomicI32 {
   match unit {
     0 => &OVERFLOW_UNIT0,
     1 => &OVERFLOW_UNIT1,
     2 => &OVERFLOW_UNIT2,
     3 => &OVERFLOW_UNIT3,
-    _ => &OVERFLOW_UNIT0,
+    _ => panic!("PCNT unit index out of range: {unit}"),
   }
 }
 

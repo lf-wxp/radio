@@ -6,7 +6,7 @@ version = "0.1.0"
 
 [[bin]]
 name = "radio"
-path = "./src/bin/main.rs"
+path = "./src/bin/radio/main.rs"
 test = false
 
 [[test]]
@@ -37,6 +37,8 @@ embassy-net = {version = "0.9.1", features = [
   "tcp",
   "udp",
 ]}
+embassy-sync = {version = "0.8.0", features = ["defmt"]}
+embassy-futures = {version = "0.1.2", default-features = false, features = ["defmt"]}
 embedded-io = {version = "0.7.1", features = ["defmt"]}
 embedded-io-async = {version = "0.7.0", features = ["defmt"]}
 esp-alloc = {version = "0.10.0", features = ["defmt"]}
@@ -131,3 +133,4 @@ codegen-units = 1 # LLVM can perform better optimizations using a single thread
 debug = false 
 lto = 'fat' 
 opt-level = 'z'
+panic = 'abort'
