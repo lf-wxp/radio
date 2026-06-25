@@ -52,6 +52,9 @@ export component RadioWindow inherits MaterialWindow {
     in-out property <string> wifi-ssid: "";
     // Status line text
     in-out property <string> status-text: "Tuning...";
+    // Preset indicator: e.g. "P 3/5" when slot 3 of 5 saved is active,
+    // "P -/5" when current freq is unsaved, empty when none saved.
+    in-out property <string> preset-text: "";
 
     // Computed: integer/decimal split for frequency display
     property <int> freq-int: freq-mhz-x10 / 10;
@@ -321,6 +324,13 @@ export component RadioWindow inherits MaterialWindow {
                     style: MaterialTypography.label-small;
                     color: root.wifi-connected ? MaterialPalette.primary : MaterialPalette.outline;
                     overflow: elide;
+                }
+
+                MaterialText {
+                    text: root.preset-text;
+                    visible: root.preset-text != "";
+                    style: MaterialTypography.label-small;
+                    color: MaterialPalette.primary;
                 }
 
                 MaterialText {

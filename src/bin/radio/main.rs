@@ -31,9 +31,12 @@
 //!
 //! # User interaction
 //!
-//! - **Rotate encoder**: tune up/down by 0.1 MHz steps.
-//! - **Short press button**: seek to next strong station.
-//! - **Long press button (>= 800 ms)**: toggle mute.
+//! - **Rotate encoder**: tune up/down by 0.1 MHz steps (with acceleration).
+//! - **Short press button**: cycle to the next saved preset; falls back to
+//!   `seek-up` when no presets have been saved yet.
+//! - **Long press button (>= 800 ms)**: save the current frequency into
+//!   the next preset slot (FIFO eviction when all 8 slots are full).
+//! - **Ultra-long press (>= 2.5 s)**: toggle mute.
 //!
 //! # Architecture
 //!
@@ -55,6 +58,7 @@
 extern crate alloc;
 
 mod hardware;
+mod presets;
 mod state;
 mod tasks;
 mod ui;
@@ -75,9 +79,10 @@ use radio::si4703::{Station, format_freq};
 use radio::wifi_provision::{ConnectionConfig, ProvisioningConfig, WifiProvisioner};
 
 use crate::hardware::{DisplayPins, EncoderPins, TunerPins};
+use crate::presets::PresetStore;
 use crate::state::{
-  DEFAULT_FREQ_X10, MAX_SCAN_STATIONS, RADIO_STATE, SPECTRUM_LEN, pick_strongest, publish_freq,
-  publish_spectrum, set_status,
+  DEFAULT_FREQ_X10, MAX_SCAN_STATIONS, PRESET_EMPTY, RADIO_STATE, SPECTRUM_LEN, pick_strongest,
+  publish_freq, publish_presets, publish_spectrum, set_status,
 };
 
 slint::include_modules!();
@@ -195,6 +200,23 @@ async fn main(spawner: Spawner) -> ! {
   }
 
   // ------------------------------------------------------------------------
+  // Preset store: take the flash handle back from the provisioner and
+  // load any previously saved favourites + last-tuned frequency.
+  //
+  // Only one subsystem may own `FlashStorage` at a time (esp-storage
+  // singleton). Doing the hand-off here keeps the design lock-free in
+  // the steady state — once the radio task owns the store, it's the
+  // sole writer.
+  // ------------------------------------------------------------------------
+  let preset_store = PresetStore::open(provisioner.into_flash());
+  let stored_presets = preset_store.snapshot();
+  info!(
+    "Presets loaded: {} saved, last_tuned={}",
+    stored_presets.used(),
+    stored_presets.last_tuned
+  );
+
+  // ------------------------------------------------------------------------
   // Si4703 FM tuner init
   // ------------------------------------------------------------------------
   set_status("Init tuner...").await;
@@ -224,15 +246,21 @@ async fn main(spawner: Spawner) -> ! {
   let _ = radio_chip.set_volume(&mut i2c, 8);
 
   // ------------------------------------------------------------------------
-  // Boot-time scan: pick the strongest station to start with
+  // Boot-time tuning target: prefer the last-tuned frequency restored
+  // from flash; fall back to a band scan when there's no saved value
+  // (first boot, wiped flash, etc.).
   // ------------------------------------------------------------------------
-  set_status("Scanning...").await;
-  ui::render_once(&window, &ui_root, &mut display).await;
-
-  let mut stations = [Station::empty(); MAX_SCAN_STATIONS];
-  let initial_freq = match radio_chip.scan_stations(&mut i2c, &mut stations).await {
-    Ok(count) if count > 0 => pick_strongest(&stations[..count]).unwrap_or(DEFAULT_FREQ_X10),
-    _ => DEFAULT_FREQ_X10,
+  let initial_freq = if stored_presets.last_tuned != PRESET_EMPTY {
+    info!("Restoring last_tuned freq: {}", stored_presets.last_tuned);
+    stored_presets.last_tuned
+  } else {
+    set_status("Scanning...").await;
+    ui::render_once(&window, &ui_root, &mut display).await;
+    let mut stations = [Station::empty(); MAX_SCAN_STATIONS];
+    match radio_chip.scan_stations(&mut i2c, &mut stations).await {
+      Ok(count) if count > 0 => pick_strongest(&stations[..count]).unwrap_or(DEFAULT_FREQ_X10),
+      _ => DEFAULT_FREQ_X10,
+    }
   };
 
   // Boot-time RSSI sweep across the whole FM band. Runs once, before we
@@ -250,6 +278,7 @@ async fn main(spawner: Spawner) -> ! {
   info!("Tuning to {}.{} MHz", mhz, dec);
   let _ = radio_chip.tune(&mut i2c, initial_freq).await;
   publish_freq(initial_freq).await;
+  publish_presets(stored_presets, initial_freq).await;
   set_status("Ready").await;
 
   // ------------------------------------------------------------------------
@@ -272,8 +301,10 @@ async fn main(spawner: Spawner) -> ! {
   // Spawn input + radio control tasks; render UI in main
   // ------------------------------------------------------------------------
   spawner.spawn(tasks::input_task(encoder).expect("create input_task token"));
-  spawner
-    .spawn(tasks::radio_control_task(radio_chip, i2c).expect("create radio_control_task token"));
+  spawner.spawn(
+    tasks::radio_control_task(radio_chip, i2c, preset_store)
+      .expect("create radio_control_task token"),
+  );
 
   // Tiny pause to let tasks initialise before we monopolise the executor.
   Timer::after(Duration::from_millis(10)).await;

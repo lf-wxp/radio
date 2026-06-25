@@ -17,10 +17,11 @@ use alloc::string::String;
 use radio::rotary_encoder::RotaryEncoder;
 use radio::si4703::{RdsClockTime, RdsDecoder, SeekDirection, Si4703};
 
+use crate::presets::PresetStore;
 use crate::state::{
-  DEFAULT_FREQ_X10, INPUT_CMDS, LONG_PRESS_MS, RADIO_STATE, RadioCommand, STATION_NAME_PLACEHOLDER,
-  TUNE_STEP_X10, clamp_freq, publish_clock, publish_freq, publish_pty, publish_radio_text,
-  publish_station_name,
+  DEFAULT_FREQ_X10, INPUT_CMDS, LAST_TUNED_DEBOUNCE_MS, LONG_PRESS_MS, RADIO_STATE, RadioCommand,
+  STATION_NAME_PLACEHOLDER, TUNE_STEP_X10, ULTRA_LONG_PRESS_MS, clamp_freq, publish_clock,
+  publish_freq, publish_presets, publish_pty, publish_radio_text, publish_station_name,
 };
 
 /// Tracks wall-clock time derived from RDS Group 4A (Clock-Time).
@@ -64,6 +65,24 @@ impl WallClock {
     let wrapped = total_local.rem_euclid(24 * 60);
     ((wrapped / 60) as u8, (wrapped % 60) as u8)
   }
+}
+
+/// Three-tier state machine for the encoder push button.
+///
+/// The transitions live entirely in [`input_task`] — this enum is a
+/// type-safe alternative to a `bool` pair that would otherwise need
+/// to encode the same three states.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PressStage {
+  /// Button is not currently pressed.
+  Idle,
+  /// Pressed, but the long-press threshold has not yet been crossed.
+  Holding,
+  /// Long-press fired (`SavePreset`); waiting for either release or
+  /// the ultra-long threshold.
+  SaveFired,
+  /// Ultra-long-press fired (`ToggleMute`); waiting for release.
+  MuteFired,
 }
 
 /// Hysteresis controller that automatically forces mono mode on the
@@ -188,8 +207,19 @@ struct RefreshContext<'a> {
 /// frequency from "running away" at the end of a fast spin and makes
 /// fine adjustments deterministic after any pause.
 ///
-/// The push button distinguishes a short press (`SeekUp`) from a long
-/// press (`ToggleMute`).
+/// The push button drives a three-tier gesture state machine:
+///
+/// | hold time         | command       | rationale                                   |
+/// |-------------------|---------------|---------------------------------------------|
+/// | `< 800 ms`        | `CyclePreset` | most frequent action; falls back to `SeekUp` inside the radio task when no preset is saved |
+/// | `800..=2500 ms`   | `SavePreset`  | saving a station should be quick & one-handed, so it sits at the medium tier |
+/// | `> 2500 ms`       | `ToggleMute`  | rarer, intentionally awkward to avoid accidental mutes |
+///
+/// Each tier fires *exactly once* per press: while the user is still
+/// holding past `LONG_PRESS_MS` we send the save command immediately so
+/// they get tactile feedback (UI badge), and only escalate to mute if
+/// they keep holding past `ULTRA_LONG_PRESS_MS`. Releasing without
+/// reaching the long-press threshold replays as a short-press.
 #[embassy_executor::task]
 pub async fn input_task(mut encoder: RotaryEncoder<'static, 0>) -> ! {
   /// Number of raw PCNT counts per encoder detent (KY-040 typically emits 4).
@@ -202,8 +232,10 @@ pub async fn input_task(mut encoder: RotaryEncoder<'static, 0>) -> ! {
   const ACCEL_IDLE_RESET_MS: u64 = 500;
 
   let mut residual: i32 = 0;
+  // Tracks how far through the gesture timeline the current press has
+  // already escalated. `None` means "not pressed".
   let mut press_start: Option<Instant> = None;
-  let mut long_press_fired = false;
+  let mut press_stage: PressStage = PressStage::Idle;
   // Acceleration state: the timestamp of the last wake that produced
   // motion and the sign of that motion. `None` means "no motion yet
   // this session", which is treated identically to "idle for > reset".
@@ -258,25 +290,36 @@ pub async fn input_task(mut encoder: RotaryEncoder<'static, 0>) -> ! {
       }
     }
 
-    // --- Button handling: short = seek, long = mute toggle ---
+    // --- Button handling: short = cycle/seek, long = save, ultra = mute ---
     let pressed = encoder.is_button_pressed();
     match (press_start, pressed) {
       (None, true) => {
         press_start = Some(Instant::now());
-        long_press_fired = false;
+        press_stage = PressStage::Holding;
       }
       (Some(start), true) => {
-        if !long_press_fired && start.elapsed() >= Duration::from_millis(LONG_PRESS_MS) {
-          let _ = INPUT_CMDS.try_send(RadioCommand::ToggleMute);
-          long_press_fired = true;
+        let held = start.elapsed();
+        // Escalate stages at each threshold crossing; `match` ensures we
+        // emit exactly one command per stage transition.
+        match press_stage {
+          PressStage::Holding if held >= Duration::from_millis(LONG_PRESS_MS) => {
+            let _ = INPUT_CMDS.try_send(RadioCommand::SavePreset);
+            press_stage = PressStage::SaveFired;
+          }
+          PressStage::SaveFired if held >= Duration::from_millis(ULTRA_LONG_PRESS_MS) => {
+            let _ = INPUT_CMDS.try_send(RadioCommand::ToggleMute);
+            press_stage = PressStage::MuteFired;
+          }
+          _ => {}
         }
       }
       (Some(_), false) => {
-        if !long_press_fired {
-          let _ = INPUT_CMDS.try_send(RadioCommand::SeekUp);
+        if matches!(press_stage, PressStage::Holding) {
+          // Released before any long-press fired — it's a short press.
+          let _ = INPUT_CMDS.try_send(RadioCommand::CyclePreset);
         }
         press_start = None;
-        long_press_fired = false;
+        press_stage = PressStage::Idle;
       }
       (None, false) => {}
     }
@@ -293,10 +336,14 @@ pub async fn input_task(mut encoder: RotaryEncoder<'static, 0>) -> ! {
 ///   branch, so command bursts don't trigger redundant I2C reads.
 /// - We `yield_now()` between the two synchronous I2C reads to give the
 ///   UI render task and the input task a chance to run.
+/// - The task also owns the [`PresetStore`]: every preset save writes
+///   immediately, while `last_tuned` is debounced for
+///   [`LAST_TUNED_DEBOUNCE_MS`] to keep flash erase counts low.
 #[embassy_executor::task]
 pub async fn radio_control_task(
   mut radio_chip: Si4703,
   mut i2c: I2c<'static, esp_hal::Blocking>,
+  mut preset_store: PresetStore<'static>,
 ) -> ! {
   let mut rds = RdsDecoder::new();
   let mut last_rds_name = String::from(STATION_NAME_PLACEHOLDER);
@@ -307,6 +354,10 @@ pub async fn radio_control_task(
   // Auto-mono hysteresis controller. See [`MonoController`] for the
   // exact thresholds; lifted out so its state survives across ticks.
   let mut mono_ctl = MonoController::new();
+  // Tracks the most recent tune that hasn't yet been persisted.
+  // `Some(instant)` means "we owe flash a `last_tuned` write"; when the
+  // instant is older than `LAST_TUNED_DEBOUNCE_MS` we flush it.
+  let mut last_tuned_pending: Option<(u16, Instant)> = None;
 
   loop {
     match select(
@@ -322,6 +373,8 @@ pub async fn radio_control_task(
           command,
           &mut rds,
           &mut wall_clock,
+          &mut preset_store,
+          &mut last_tuned_pending,
         )
         .await;
       }
@@ -335,9 +388,37 @@ pub async fn radio_control_task(
           mono_ctl: &mut mono_ctl,
         };
         refresh_status(&mut radio_chip, &mut i2c, &mut ctx).await;
+        // Opportunistic flash flush: piggy-back on the 200 ms tick
+        // instead of a third `select` arm. Worst-case latency is one
+        // tick beyond the debounce window, which is fine.
+        flush_last_tuned_if_due(&mut preset_store, &mut last_tuned_pending);
       }
     }
   }
+}
+
+/// Persist `last_tuned` once the debounce window has elapsed.
+///
+/// **Blocking note**: the underlying `save_set` call erases one 4 KB
+/// NOR flash sector (~20–40 ms on ESP32-C6) synchronously. This blocks
+/// the executor for that duration, but since the debounce window is 30 s
+/// the actual trigger rate is at most once per tune session — negligible
+/// impact on the 200 ms tick cadence and input responsiveness.
+///
+/// Failures are non-fatal — we log and clear the pending mark so we
+/// don't busy-loop retrying on a dead flash.
+fn flush_last_tuned_if_due(store: &mut PresetStore<'static>, pending: &mut Option<(u16, Instant)>) {
+  let Some((freq, since)) = *pending else {
+    return;
+  };
+  if since.elapsed() < Duration::from_millis(LAST_TUNED_DEBOUNCE_MS) {
+    return;
+  }
+  match store.record_last_tuned(freq) {
+    Ok(()) => info!("Flash: last_tuned <- {}", freq),
+    Err(e) => info!("Flash: last_tuned save failed: {}", e),
+  }
+  *pending = None;
 }
 
 // ============================================================================
@@ -345,12 +426,21 @@ pub async fn radio_control_task(
 // ============================================================================
 
 /// Apply a single `RadioCommand` to the chip and update shared state.
+#[allow(
+  clippy::large_stack_frames,
+  reason = "async state machine of handle_command holds the union of all RadioCommand \
+            arms' frames, including transient String allocations (RDS placeholder, \
+            station name, radio text) and a PresetSet by-value copy; ~1.7 KiB total \
+            is well under the 16 KiB Embassy task stack on ESP32-C6."
+)]
 async fn handle_command(
   radio_chip: &mut Si4703,
   i2c: &mut I2c<'static, esp_hal::Blocking>,
   command: RadioCommand,
   rds: &mut RdsDecoder,
   wall_clock: &mut Option<WallClock>,
+  preset_store: &mut PresetStore<'static>,
+  last_tuned_pending: &mut Option<(u16, Instant)>,
 ) {
   match command {
     RadioCommand::TuneRelative(steps_x10) => {
@@ -367,9 +457,17 @@ async fn handle_command(
         publish_radio_text(String::new()).await;
         publish_clock(None).await;
         publish_pty(None).await;
+        // Only update preset indicator when the active slot actually
+        // changes (e.g. tuning away from a saved frequency). This avoids
+        // acquiring the state lock on every rotary tick during fast tuning.
+        let new_idx = preset_store.snapshot().position(next).map(|i| i as u8);
+        let old_idx = RADIO_STATE.lock().await.preset_idx;
+        if new_idx != old_idx {
+          publish_presets(preset_store.snapshot(), next).await;
+        }
+        *last_tuned_pending = Some((next, Instant::now()));
       }
     }
-    RadioCommand::SeekUp => seek(radio_chip, i2c, rds, wall_clock, SeekDirection::Up).await,
     RadioCommand::ToggleMute => {
       let new_muted = {
         let state = RADIO_STATE.lock().await;
@@ -382,6 +480,55 @@ async fn handle_command(
         info!("Mute: {}", new_muted);
       }
     }
+    RadioCommand::SavePreset => {
+      let current = radio_chip
+        .current_frequency(i2c)
+        .unwrap_or(DEFAULT_FREQ_X10);
+      match preset_store.save_freq(current) {
+        Ok(idx) => {
+          info!("Preset saved: freq={} slot={}", current, idx);
+          publish_presets(preset_store.snapshot(), current).await;
+        }
+        Err(e) => info!("Preset save failed: {}", e),
+      }
+    }
+    RadioCommand::CyclePreset => {
+      let current = radio_chip
+        .current_frequency(i2c)
+        .unwrap_or(DEFAULT_FREQ_X10);
+      match preset_store.snapshot().next_after(current) {
+        Some(target) if target != current => {
+          info!("Preset cycle: {} -> {}", current, target);
+          if radio_chip.tune(i2c, target).await.is_ok() {
+            rds.reset();
+            *wall_clock = None;
+            publish_freq(target).await;
+            publish_station_name(String::from(STATION_NAME_PLACEHOLDER)).await;
+            publish_radio_text(String::new()).await;
+            publish_clock(None).await;
+            publish_pty(None).await;
+            publish_presets(preset_store.snapshot(), target).await;
+            *last_tuned_pending = Some((target, Instant::now()));
+          }
+        }
+        _ => {
+          // Empty preset table or only one slot equal to `current`:
+          // fall back to the legacy short-press behaviour so the
+          // gesture remains useful from cold boot.
+          info!("Preset cycle: empty/duplicate, falling back to seek");
+          seek(
+            radio_chip,
+            i2c,
+            rds,
+            wall_clock,
+            SeekDirection::Up,
+            preset_store,
+            last_tuned_pending,
+          )
+          .await;
+        }
+      }
+    }
   }
 }
 
@@ -392,6 +539,8 @@ async fn seek(
   rds: &mut RdsDecoder,
   wall_clock: &mut Option<WallClock>,
   direction: SeekDirection,
+  preset_store: &mut PresetStore<'static>,
+  last_tuned_pending: &mut Option<(u16, Instant)>,
 ) {
   match radio_chip.seek(i2c, direction).await {
     Ok(Some(freq)) => {
@@ -403,6 +552,8 @@ async fn seek(
       publish_radio_text(String::new()).await;
       publish_clock(None).await;
       publish_pty(None).await;
+      publish_presets(preset_store.snapshot(), freq).await;
+      *last_tuned_pending = Some((freq, Instant::now()));
     }
     Ok(None) => info!("Seek: end of band"),
     Err(_) => info!("Seek: I2C error"),

@@ -55,8 +55,9 @@
 ## ✨ Features
 
 - 📻 **FM tuner** — Si4703 over I²C, automatic strongest-station scan on boot, RDS-aware UI (PS station name + RT scrolling text, GB2312/UTF-8 extension friendly).
-- 🔊 **Volume + mute** — long-press encoder to mute, dedicated volume bar in the UI.
-- 🎛️ **Tactile control** — KY-040 rotary encoder driven by the **PCNT** hardware peripheral (no ISR jitter), short press = seek, long press (≥ 800 ms) = mute.
+- 🔊 **Volume + mute** — ultra-long-press (≥ 2.5 s) encoder to mute, dedicated volume bar in the UI.
+- 🎛️ **Tactile control** — KY-040 rotary encoder driven by the **PCNT** hardware peripheral (no ISR jitter); rotate to tune (with acceleration), short press to cycle saved presets, long press (≥ 800 ms) to save the current station.
+- ⭐ **Presets + auto-resume** — up to 8 favourite stations persisted to flash via `esp-storage`; the last-tuned frequency is restored on next boot (debounced to keep flash erase counts low).
 - 📶 **WiFi provisioning** — first-boot SoftAP captive portal, credentials persisted to flash via `esp-storage`. Subsequent boots auto-reconnect.
 - 🖥️ **Slint UI** — Material-1.0 themed `ui/radio_ui.slint`, software-rendered on a 240×320 ST7789, host-previewable on macOS / Linux / Windows.
 - 🔁 **Embassy async** — fully `no_std`, `embassy-executor` + `embassy-sync` channels/mutexes between input task ↔ radio task ↔ UI render loop.
@@ -96,8 +97,9 @@
 **User interaction**
 
 - Rotate encoder → tune ±0.1 MHz.
-- Short press → seek to next strong station.
-- Long press (≥ 800 ms) → toggle mute.
+- Short press → cycle to the next saved preset (falls back to seek-up when no presets are saved).
+- Long press (≥ 800 ms) → save current frequency to the next preset slot (8 slots, FIFO eviction).
+- Ultra-long press (≥ 2.5 s) → toggle mute.
 
 ---
 
@@ -424,8 +426,7 @@ working days.
 | ✅  | Stereo indicator + auto-mono on weak signal                 | 0.5 d  | Si4703 `STATUSRSSI` bit 8 + existing `set_mono`. Hysteresis controller in tasks.rs.    |
 | ✅  | RSSI band scope ("see-the-band" tuning UI)                  | 1 d    | Boot-time `sweep_rssi` over 87.5–108.0 MHz; 52-bucket bar chart with cursor highlight. Shipped 2026-06. |
 | ✅  | Tune acceleration on the rotary encoder                     | 0.25 d | Detent-rate-driven step multiplier (×1/×2/×3/×5) with direction-reversal & idle resets. Shipped 2026-06. |
-| 3   | Presets (favourite stations) + restore last frequency       | 1.5 d  | Reuse `esp-storage`; long-press to save, ultra-long to delete.                       |
-| 5   | Sleep timer + alarm clock                                   | 1 d    | Built on the RDS-CT wall clock; mute / tune-on schedule.                             |
+| ✅  | Presets + restore last frequency on boot                    | 1.5 d  | `esp-storage` record at partition `storage` (0x3E_0000); short-press cycles saved stations, long-press saves, ultra-long mutes. Shipped 2026-06. |
 | 6   | RDS-AF alternative-frequency follow                         | 2 d    | Group 0A block C is already piped in but discarded.                                  |
 | 7   | LAN web console via `picoserve` (`/api/state`, `/api/tune`) | 2 d    | Tiny single-page HTML + JSON API; phone becomes a remote.                            |
 | 8   | mDNS broadcast `esp-radio.local`                            | 1 d    | Minimal responder over the existing `socket-udp`; pairs with #7.                     |
@@ -446,6 +447,9 @@ on the roadmap:
 - Touch-driven UI menus — current ST7789 module has no touch layer.
 - Battery fuel-gauge widget — depends on a battery-monitor IC the
   reference board does not expose.
+- Sleep timer / alarm clock — would lean on the RDS-CT wall clock,
+  which is unreliable on stations that don't broadcast group 4A;
+  not worth the extra UI mode given the use case.
 
 ### 📑 Design documents
 

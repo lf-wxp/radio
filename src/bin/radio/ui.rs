@@ -47,6 +47,20 @@ fn apply_state_to_ui(ui: &RadioWindow, snapshot: &RadioState) {
   ui.set_stereo_text(stereo_text.into());
   ui.set_stereo_active(snapshot.stereo && !snapshot.auto_mono);
 
+  // Preset indicator: empty when nothing saved (component hides itself
+  // via `visible: preset-text != ""`); otherwise `P {idx}/{used}` when
+  // current freq is on a saved slot, or `P -/{used}` when not.
+  let used = snapshot.presets.used();
+  let preset_text = if used == 0 {
+    alloc::string::String::new()
+  } else {
+    match snapshot.preset_idx {
+      Some(idx) => alloc::format!("P {}/{}", idx + 1, used),
+      None => alloc::format!("P -/{}", used),
+    }
+  };
+  ui.set_preset_text(preset_text.as_str().into());
+
   // Push the boot-time RSSI sweep into the Slint `[int]` model. We
   // rebuild a `VecModel` every refresh because the snapshot is small
   // (52 ints) and Slint copies the model handle by reference internally.

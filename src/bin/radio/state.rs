@@ -22,7 +22,39 @@ pub const DEFAULT_FREQ_X10: u16 = 875;
 pub const TUNE_STEP_X10: i16 = 1;
 
 /// Long-press threshold for the encoder button (milliseconds).
+///
+/// Holding the button between [`LONG_PRESS_MS`] and [`ULTRA_LONG_PRESS_MS`]
+/// triggers `SavePreset`; sustained hold past [`ULTRA_LONG_PRESS_MS`]
+/// upgrades the gesture to `ToggleMute`.
 pub const LONG_PRESS_MS: u64 = 800;
+
+/// Ultra-long-press threshold (milliseconds).
+///
+/// Reached only when the user keeps holding past [`LONG_PRESS_MS`] for
+/// another ~1.7 s; primarily used to keep mute toggle accessible without
+/// crowding the more frequent `SavePreset` shortcut.
+pub const ULTRA_LONG_PRESS_MS: u64 = 2_500;
+
+/// Maximum number of preset (favourite) stations stored on Flash.
+///
+/// 8 fits a single 4-bit slot index and shows comfortably as one row of
+/// dots on a 240-pixel wide UI; raising it requires bumping
+/// [`PresetSet`]'s on-Flash record version (see `presets::storage`).
+pub const MAX_PRESETS: usize = 8;
+
+/// Sentinel value stored in an empty [`PresetSet`] slot.
+///
+/// `0` is below the FM band's lower bound (`875` = 87.5 MHz) so it
+/// can never collide with a real frequency.
+pub const PRESET_EMPTY: u16 = 0;
+
+/// Quiet-period (milliseconds) before persisting `last_tuned` to Flash.
+///
+/// Tuning hammers the encoder; we coalesce bursts so we only write
+/// Flash once the dial has settled. 30 s is short enough that a normal
+/// "tune then walk away" still saves before power-off, yet long enough
+/// to keep Flash erase counts in the low thousands across years of use.
+pub const LAST_TUNED_DEBOUNCE_MS: u64 = 30_000;
 
 /// Maximum number of stations remembered during the boot-time scan.
 pub const MAX_SCAN_STATIONS: usize = 20;
@@ -45,10 +77,101 @@ pub const SPECTRUM_LEN: usize = 52;
 pub enum RadioCommand {
   /// Tune by a relative number of 0.1 MHz steps (positive = up).
   TuneRelative(i16),
-  /// Seek to the next station upwards.
-  SeekUp,
   /// Toggle mute.
   ToggleMute,
+  /// Save the current frequency into the next preset slot.
+  ///
+  /// If the frequency is already saved, the command is a no-op.
+  /// Otherwise it overwrites the oldest slot when the table is full,
+  /// keeping the working set bounded by [`crate::state::MAX_PRESETS`].
+  SavePreset,
+  /// Cycle to the next saved preset (wraps around).
+  ///
+  /// Falls back to a `seek-up` inside the radio task when the preset
+  /// table is empty, so the gesture stays useful from cold boot.
+  CyclePreset,
+}
+
+/// Snapshot of the user's saved presets, copied by value into
+/// [`RadioState`] for the input task and UI to read without needing a
+/// second lock.
+///
+/// On-disk persistence lives in `presets::storage::PresetStore`; this
+/// type is the in-memory mirror.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PresetSet {
+  /// Frequencies in MHz x 10. Empty slots hold [`PRESET_EMPTY`].
+  pub freqs: [u16; MAX_PRESETS],
+  /// Last tuned frequency (MHz x 10), restored on next boot.
+  /// `0` means "unset" — fall back to the boot scan in that case.
+  pub last_tuned: u16,
+}
+
+impl PresetSet {
+  /// All slots empty; used both as the boot default and after a wipe.
+  #[must_use]
+  pub const fn empty() -> Self {
+    Self {
+      freqs: [PRESET_EMPTY; MAX_PRESETS],
+      last_tuned: PRESET_EMPTY,
+    }
+  }
+
+  /// Return how many slots currently hold a real frequency.
+  #[must_use]
+  pub fn used(&self) -> usize {
+    self.freqs.iter().filter(|&&f| f != PRESET_EMPTY).count()
+  }
+
+  /// Find the slot index storing `freq_x10`, if any.
+  #[must_use]
+  pub fn position(&self, freq_x10: u16) -> Option<usize> {
+    self.freqs.iter().position(|&f| f == freq_x10)
+  }
+
+  /// Insert `freq_x10` into the next free slot, returning that index.
+  ///
+  /// If the frequency is already saved, returns its existing index.
+  /// If all slots are full, the first slot is overwritten (FIFO).
+  pub fn save(&mut self, freq_x10: u16) -> usize {
+    if let Some(idx) = self.position(freq_x10) {
+      return idx;
+    }
+    if let Some(idx) = self.freqs.iter().position(|&f| f == PRESET_EMPTY) {
+      self.freqs[idx] = freq_x10;
+      return idx;
+    }
+    // FIFO eviction: shift left, append.
+    self.freqs.copy_within(1.., 0);
+    let last = MAX_PRESETS - 1;
+    self.freqs[last] = freq_x10;
+    last
+  }
+
+  /// Return the next saved frequency after `current` (wrap-around).
+  ///
+  /// `None` when the table is empty. Note: if all occupied slots hold
+  /// the same frequency as `current`, the returned value will equal
+  /// `current` — callers should guard against this (e.g. `Some(t) if
+  /// t != current`) to avoid a redundant tune.
+  #[must_use]
+  pub fn next_after(&self, current: u16) -> Option<u16> {
+    if self.used() == 0 {
+      return None;
+    }
+    // Start search from the slot after `current` (or 0 if not present).
+    let start = self.position(current).map_or(0, |i| i + 1);
+    (0..MAX_PRESETS)
+      .map(|offset| (start + offset) % MAX_PRESETS)
+      .map(|i| self.freqs[i])
+      .find(|&f| f != PRESET_EMPTY)
+  }
+}
+
+impl Default for PresetSet {
+  fn default() -> Self {
+    Self::empty()
+  }
 }
 
 /// Snapshot of radio state shared with the UI thread.
@@ -106,6 +229,16 @@ pub struct RadioState {
   /// semantics) so the UI render task can copy it cheaply on every
   /// frame without allocating.
   pub spectrum: [u8; SPECTRUM_LEN],
+  /// In-memory mirror of the persisted preset table.
+  ///
+  /// Read by `input_task` to drive the smart short-press fallback
+  /// ("cycle preset if any saved, else SeekUp") and by the UI to
+  /// render the `P n/m` indicator. Written exclusively by the radio
+  /// control task after a successful Flash store.
+  pub presets: PresetSet,
+  /// Slot index of the currently tuned preset, or `None` if the dial
+  /// sits on a frequency that hasn't been saved.
+  pub preset_idx: Option<u8>,
   /// True when fields have been mutated since the UI last read them.
   pub dirty: bool,
 }
@@ -127,6 +260,8 @@ impl RadioState {
       wifi_ssid: String::new(),
       status: "Booting...",
       spectrum: [0; SPECTRUM_LEN],
+      presets: PresetSet::empty(),
+      preset_idx: None,
       dirty: true,
     }
   }
@@ -235,4 +370,19 @@ pub async fn set_status(status: &'static str) {
   let mut state = RADIO_STATE.lock().await;
   state.status = status;
   state.dirty = true;
+}
+
+/// Publish a fresh `PresetSet` snapshot together with the recomputed
+/// active-slot index for the given current frequency.
+///
+/// Called by `radio_control_task` after every successful Flash store
+/// and after a tune that may have moved onto / off a saved preset.
+pub async fn publish_presets(presets: PresetSet, current_freq_x10: u16) {
+  let preset_idx = presets.position(current_freq_x10).map(|i| i as u8);
+  let mut state = RADIO_STATE.lock().await;
+  if state.presets != presets || state.preset_idx != preset_idx {
+    state.presets = presets;
+    state.preset_idx = preset_idx;
+    state.dirty = true;
+  }
 }

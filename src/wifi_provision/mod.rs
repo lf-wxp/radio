@@ -531,6 +531,15 @@ impl<'d> WifiProvisioner<'d> {
     self.storage.has_credentials()
   }
 
+  /// Consume the provisioner and return the underlying [`FlashStorage`].
+  ///
+  /// Used by the binary to hand the (singleton) flash peripheral to a
+  /// different subsystem — e.g. the FM-radio preset store — once
+  /// provisioning + connection are done.
+  pub fn into_flash(self) -> FlashStorage<'d> {
+    self.storage.into_flash()
+  }
+
   /// Complete provisioning + connection flow in one call.
   ///
   /// This method handles the entire WiFi lifecycle:

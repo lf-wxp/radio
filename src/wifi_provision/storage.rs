@@ -213,7 +213,7 @@ impl<'d> CredentialStorage<'d> {
     Ok(())
   }
 
-  /// Check if valid credentials are stored without fully parsing them.
+  /// Check if a record's magic header is present (does not validate CRC).
   pub fn has_credentials(&mut self) -> bool {
     let mut buf = [0u8; HEADER_SIZE];
     if self.flash.read(self.offset, &mut buf).is_err() {
@@ -221,6 +221,14 @@ impl<'d> CredentialStorage<'d> {
     }
     let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
     magic == MAGIC
+  }
+
+  /// Consume this storage handle and return the underlying [`FlashStorage`].
+  ///
+  /// Useful when the caller wants to hand the (singleton) flash peripheral
+  /// to a different subsystem after provisioning has finished.
+  pub fn into_flash(self) -> FlashStorage<'d> {
+    self.flash
   }
 }
 
