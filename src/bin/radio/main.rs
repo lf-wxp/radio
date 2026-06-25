@@ -76,7 +76,8 @@ use radio::wifi_provision::{ConnectionConfig, ProvisioningConfig, WifiProvisione
 
 use crate::hardware::{DisplayPins, EncoderPins, TunerPins};
 use crate::state::{
-  DEFAULT_FREQ_X10, MAX_SCAN_STATIONS, RADIO_STATE, pick_strongest, publish_freq, set_status,
+  DEFAULT_FREQ_X10, MAX_SCAN_STATIONS, RADIO_STATE, SPECTRUM_LEN, pick_strongest, publish_freq,
+  publish_spectrum, set_status,
 };
 
 slint::include_modules!();
@@ -233,6 +234,18 @@ async fn main(spawner: Spawner) -> ! {
     Ok(count) if count > 0 => pick_strongest(&stations[..count]).unwrap_or(DEFAULT_FREQ_X10),
     _ => DEFAULT_FREQ_X10,
   };
+
+  // Boot-time RSSI sweep across the whole FM band. Runs once, before we
+  // commit to the playback frequency, and seeds the on-screen spectrum
+  // bar that the UI shows from then on. Failure is non-fatal — the UI
+  // simply renders a flat baseline if the sweep does not complete.
+  set_status("Sweep...").await;
+  ui::render_once(&window, &ui_root, &mut display).await;
+  let mut spectrum = [0u8; SPECTRUM_LEN];
+  if radio_chip.sweep_rssi(&mut i2c, &mut spectrum).await.is_ok() {
+    publish_spectrum(&spectrum).await;
+  }
+
   let (mhz, dec) = format_freq(initial_freq);
   info!("Tuning to {}.{} MHz", mhz, dec);
   let _ = radio_chip.tune(&mut i2c, initial_freq).await;

@@ -6,6 +6,9 @@
   "station-name": "CRI Easy",
   "radio-text": "Now playing: 测试中文 RDS 滚动文本 — Imagine by John Lennon · 101.5 MHz",
   "clock-text": "19:42",
+  "pty-label": "Pop M",
+  "stereo-text": "ST",
+  "stereo-active": true,
   "wifi-connected": true,
   "wifi-ssid": "MyHomeWiFi",
   "status-text": "Tuned"

@@ -27,6 +27,15 @@ pub const LONG_PRESS_MS: u64 = 800;
 /// Maximum number of stations remembered during the boot-time scan.
 pub const MAX_SCAN_STATIONS: usize = 20;
 
+/// Number of buckets in the boot-time RSSI spectrum sweep.
+///
+/// 52 buckets across the 87.5–108.0 MHz FM band gives a 0.4 MHz step
+/// (≈ 4 channels per bucket at the Si4703's 100 kHz spacing). That is
+/// dense enough to make individual stations stand out as distinct
+/// peaks while keeping the sweep under ~3.5 s of blocking I²C traffic
+/// at boot.
+pub const SPECTRUM_LEN: usize = 52;
+
 // ============================================================================
 // Shared state types
 // ============================================================================
@@ -65,6 +74,13 @@ pub struct RadioState {
   pub rssi: u8,
   pub volume: u8,
   pub muted: bool,
+  /// True when the Si4703 is currently locked onto a stereo pilot.
+  /// Updated on every refresh tick (~5 Hz) by reading STATUSRSSI bit 8.
+  pub stereo: bool,
+  /// True when the radio-control task has *automatically* forced mono
+  /// mode in response to a sustained low RSSI. Used by the UI to show
+  /// an `auto-MO` hint instead of the regular stereo indicator.
+  pub auto_mono: bool,
   /// Decoded RDS PS (programme service) name.
   pub station_name: String,
   /// Decoded RDS RT (RadioText) message; empty when station does not broadcast RT.
@@ -72,9 +88,24 @@ pub struct RadioState {
   /// Local time `(hour, minute)` decoded from RDS CT, or `None` until
   /// the first valid CT frame is received on the current station.
   pub clock_hh_mm: Option<(u8, u8)>,
+  /// Short Programme Type label (e.g. `"News"`, `"Pop M"`) decoded from
+  /// every RDS Block B. `None` when no RDS group has been received yet
+  /// or when the broadcaster reports PTY 0 ("no programme type").
+  pub pty_label: Option<&'static str>,
   pub wifi_connected: bool,
   pub wifi_ssid: String,
   pub status: &'static str,
+  /// Snapshot of the RSSI band sweep captured at boot time.
+  ///
+  /// Each `spectrum[i]` is the chip-reported RSSI (`0..=75`) at the
+  /// centre of bucket `i`, where bucket 0 is at the band's bottom
+  /// frequency and bucket [`SPECTRUM_LEN`] − 1 sits one step below the
+  /// band top. All zeros until [`crate::main`] runs the boot sweep.
+  ///
+  /// Stored inline as a fixed-size array (no heap, [`Copy`]-like
+  /// semantics) so the UI render task can copy it cheaply on every
+  /// frame without allocating.
+  pub spectrum: [u8; SPECTRUM_LEN],
   /// True when fields have been mutated since the UI last read them.
   pub dirty: bool,
 }
@@ -86,12 +117,16 @@ impl RadioState {
       rssi: 0,
       volume: 8,
       muted: false,
+      stereo: false,
+      auto_mono: false,
       station_name: String::new(),
       radio_text: String::new(),
       clock_hh_mm: None,
+      pty_label: None,
       wifi_connected: false,
       wifi_ssid: String::new(),
       status: "Booting...",
+      spectrum: [0; SPECTRUM_LEN],
       dirty: true,
     }
   }
@@ -146,6 +181,17 @@ pub async fn publish_freq(freq_mhz_x10: u16) {
   state.dirty = true;
 }
 
+/// Replace the shared spectrum snapshot.
+///
+/// Caller is expected to pass the freshly captured sweep buffer; the
+/// internal copy is `memcpy`-cheap (52 bytes) so we don't bother with
+/// a dirty diff.
+pub async fn publish_spectrum(spectrum: &[u8; SPECTRUM_LEN]) {
+  let mut state = RADIO_STATE.lock().await;
+  state.spectrum.copy_from_slice(spectrum);
+  state.dirty = true;
+}
+
 /// Update the shared station-name snapshot.
 pub async fn publish_station_name(name: String) {
   let mut state = RADIO_STATE.lock().await;
@@ -168,6 +214,18 @@ pub async fn publish_clock(hh_mm: Option<(u8, u8)>) {
   let mut state = RADIO_STATE.lock().await;
   if state.clock_hh_mm != hh_mm {
     state.clock_hh_mm = hh_mm;
+    state.dirty = true;
+  }
+}
+
+/// Update the shared Programme Type (PTY) snapshot.
+///
+/// Pass `None` to hide the badge (e.g. on station change before any RDS
+/// group is decoded, or when PTY = 0 "None").
+pub async fn publish_pty(label: Option<&'static str>) {
+  let mut state = RADIO_STATE.lock().await;
+  if state.pty_label != label {
+    state.pty_label = label;
     state.dirty = true;
   }
 }

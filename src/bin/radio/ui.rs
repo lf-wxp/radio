@@ -8,7 +8,7 @@ use slint::platform::software_renderer::MinimalSoftwareWindow;
 use radio::display::DisplayLineBuffer;
 
 use crate::RadioWindow;
-use crate::state::{RADIO_STATE, RadioState};
+use crate::state::{RADIO_STATE, RadioState, SPECTRUM_LEN};
 
 /// Mirror a [`RadioState`] snapshot into the Slint component.
 fn apply_state_to_ui(ui: &RadioWindow, snapshot: &RadioState) {
@@ -29,6 +29,57 @@ fn apply_state_to_ui(ui: &RadioWindow, snapshot: &RadioState) {
     None => alloc::string::String::new(),
   };
   ui.set_clock_text(clock_text.as_str().into());
+  // Programme Type badge: empty string keeps the Slint component hidden
+  // (`visible: pty-label != ""`). The label is already a `&'static str`
+  // from `radio::si4703::pty_label`, so no allocation is required.
+  ui.set_pty_label(snapshot.pty_label.unwrap_or("").into());
+  // Stereo / mono indicator. Three states reflected in one string:
+  //   "ST"      — Si4703 reports stereo lock
+  //   "MO"      — plain mono (no stereo pilot detected)
+  //   "MO*"     — auto-mono engaged (we forced it because of weak RSSI)
+  let stereo_text = if snapshot.auto_mono {
+    "MO*"
+  } else if snapshot.stereo {
+    "ST"
+  } else {
+    "MO"
+  };
+  ui.set_stereo_text(stereo_text.into());
+  ui.set_stereo_active(snapshot.stereo && !snapshot.auto_mono);
+
+  // Push the boot-time RSSI sweep into the Slint `[int]` model. We
+  // rebuild a `VecModel` every refresh because the snapshot is small
+  // (52 ints) and Slint copies the model handle by reference internally.
+  let spectrum_vec: alloc::vec::Vec<i32> = snapshot.spectrum.iter().map(|&v| v as i32).collect();
+  ui.set_spectrum(slint::ModelRc::new(slint::VecModel::from(spectrum_vec)));
+  ui.set_spectrum_cursor(spectrum_cursor_for(snapshot.freq_mhz_x10));
+}
+
+/// Compute the index of the spectrum bucket containing `freq_mhz_x10`.
+///
+/// Mirrors the bucket layout used by [`radio::si4703::Si4703::sweep_rssi`]:
+/// bucket `i` covers `[bottom + span*i/N, bottom + span*(i+1)/N)`. We
+/// look up which slot a frequency lands in using the inverse formula
+/// `i = (freq - bottom) * N / span`, clamping at both ends so the cursor
+/// stays valid for out-of-band edge cases (e.g. before the chip is tuned).
+///
+/// FM band bounds are hard-coded here to match the default
+/// [`radio::si4703::Band`] used at boot. If the firmware ever exposes a
+/// runtime band switch, this helper should be parameterised accordingly.
+fn spectrum_cursor_for(freq_mhz_x10: u16) -> i32 {
+  // FM US/Europe band: 87.5 .. 108.0 MHz.
+  const BOTTOM_X10: u16 = 875;
+  const TOP_X10: u16 = 1080;
+
+  if freq_mhz_x10 < BOTTOM_X10 {
+    return 0;
+  }
+  let span = u32::from(TOP_X10 - BOTTOM_X10);
+  // SAFETY (logical): freq_mhz_x10 ≥ BOTTOM_X10 here, subtraction is safe.
+  let offset = u32::from(freq_mhz_x10 - BOTTOM_X10);
+  let n = SPECTRUM_LEN as u32;
+  let idx = (offset * n / span).min(n - 1);
+  idx as i32
 }
 
 /// Drive Slint's software renderer once, painting any dirty regions to the

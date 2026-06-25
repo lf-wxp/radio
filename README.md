@@ -42,6 +42,9 @@
   - [🧰 Tech stack](#-tech-stack)
   - [🐛 Troubleshooting \& FAQ](#-troubleshooting--faq)
   - [🗺️ Roadmap](#️-roadmap)
+    - [✅ Shipped](#-shipped)
+    - [🚧 Planned (no extra hardware required)](#-planned-no-extra-hardware-required)
+    - [🚫 Out of scope on current hardware](#-out-of-scope-on-current-hardware)
     - [📑 Design documents](#-design-documents)
   - [🤝 Contributing](#-contributing)
   - [🙏 Acknowledgements](#-acknowledgements)
@@ -397,16 +400,52 @@ Most of the code is portable, but the firmware currently hard-codes ESP32-C6 fea
 
 ## 🗺️ Roadmap
 
+The roadmap below is split into three lanes so contributors can pick up
+items at different commitment levels. Items are ordered top-to-bottom by
+recommended implementation sequence within each lane.
+
+### ✅ Shipped
+
 - [x] FM tuning + auto-scan + RDS PS / RT
 - [x] WiFi captive portal + flash persistence
 - [x] Slint Material UI on ST7789
 - [x] On-device tests (`embedded-test`)
 - [x] RDS Clock-Time (CT) — auto-sync wall clock from group 4A
-- [ ] RDS-AF alternative frequency follow
-- [ ] Internet radio fallback (HLS/Icecast over WiFi)
-- [ ] OTA firmware update via WiFi — *design ready, implementation deferred* → see [docs/ota-design.md](./docs/ota-design.md)
-- [ ] Battery-fuel-gauge widget on the UI
-- [ ] BLE remote control (HID volume keys)
+
+### 🚧 Planned (no extra hardware required)
+
+Each item is scoped against the existing peripherals (Si4703, ST7789,
+KY-040, Wi-Fi, BLE radio, flash). Effort estimates are single-engineer
+working days.
+
+| #   | Feature                                                     | Effort | Notes                                                                                |
+| --- | ----------------------------------------------------------- | ------ | ------------------------------------------------------------------------------------ |
+| ✅  | RDS PTY (programme type) badge on the station card          | 0.5 d  | Block B already in the decoder — one bit-mask + 32-entry static table. Shipped 2026-06.|
+| ✅  | Stereo indicator + auto-mono on weak signal                 | 0.5 d  | Si4703 `STATUSRSSI` bit 8 + existing `set_mono`. Hysteresis controller in tasks.rs.    |
+| ✅  | RSSI band scope ("see-the-band" tuning UI)                  | 1 d    | Boot-time `sweep_rssi` over 87.5–108.0 MHz; 52-bucket bar chart with cursor highlight. Shipped 2026-06. |
+| ✅  | Tune acceleration on the rotary encoder                     | 0.25 d | Detent-rate-driven step multiplier (×1/×2/×3/×5) with direction-reversal & idle resets. Shipped 2026-06. |
+| 3   | Presets (favourite stations) + restore last frequency       | 1.5 d  | Reuse `esp-storage`; long-press to save, ultra-long to delete.                       |
+| 5   | Sleep timer + alarm clock                                   | 1 d    | Built on the RDS-CT wall clock; mute / tune-on schedule.                             |
+| 6   | RDS-AF alternative-frequency follow                         | 2 d    | Group 0A block C is already piped in but discarded.                                  |
+| 7   | LAN web console via `picoserve` (`/api/state`, `/api/tune`) | 2 d    | Tiny single-page HTML + JSON API; phone becomes a remote.                            |
+| 8   | mDNS broadcast `esp-radio.local`                            | 1 d    | Minimal responder over the existing `socket-udp`; pairs with #7.                     |
+| 9   | RDS listening log (rolling flash buffer of PS/RT/RSSI)      | 1 d    | Pure-text replay; no audio path needed.                                              |
+| 10  | BLE HID remote (selfie-shutter style)                       | 2–3 d  | `esp-radio` `ble` + `trouble-host` already in `Cargo.toml`; mind Wi-Fi/BLE coex.     |
+| 11  | OTA firmware update                                         | 5 d    | **Design complete**, implementation deferred → [docs/ota-design.md](./docs/ota-design.md). |
+
+### 🚫 Out of scope on current hardware
+
+Listed for transparency — these need additional silicon (audio DAC,
+microphone, touch panel, fuel gauge IC) and are intentionally **not**
+on the roadmap:
+
+- Internet radio playback (HLS / Icecast) — needs an I²S DAC + decoder.
+- Bluetooth A2DP audio source — `esp-radio` BLE stack does not cover
+  classic Bluetooth audio profiles.
+- Real-time audio FFT spectrum — no audio ADC path on the board.
+- Touch-driven UI menus — current ST7789 module has no touch layer.
+- Battery fuel-gauge widget — depends on a battery-monitor IC the
+  reference board does not expose.
 
 ### 📑 Design documents
 

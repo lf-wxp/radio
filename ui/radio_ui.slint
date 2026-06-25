@@ -20,6 +20,14 @@ export component RadioWindow inherits MaterialWindow {
     in-out property <int> rssi: 0;
     // Volume 0-15
     in-out property <int> volume: 8;
+    // Boot-time RSSI sweep snapshot. Each value is in 0..=75 and
+    // corresponds to one bucket of the FM band, evenly spaced from
+    // bottom to top. Empty until [`publish_spectrum`] runs.
+    in-out property <[int]> spectrum: [];
+    // Index into `spectrum` of the bucket currently being played, or
+    // -1 to disable the cursor highlight. Computed by the Rust UI loop
+    // from `freq-mhz-x10`.
+    in-out property <int> spectrum-cursor: -1;
     // RDS station name (8 chars)
     in-out property <string> station-name: "--------";
     // RDS RadioText (RT) free-form message; empty until decoded
@@ -27,6 +35,15 @@ export component RadioWindow inherits MaterialWindow {
     // Wall-clock text decoded from RDS Clock-Time (e.g. "19:42");
     // empty until the first valid CT frame is received.
     in-out property <string> clock-text: "";
+    // RDS Programme Type label (e.g. "News", "Pop M"). Empty when no
+    // RDS group has been decoded yet or when PTY = 0 ("None").
+    in-out property <string> pty-label: "";
+    // Stereo indicator text shown next to the RSSI value: "ST" when the
+    // chip locks onto a stereo pilot, "MO" plain mono, "MO*" when the
+    // firmware *automatically* forced mono in response to weak RSSI.
+    in-out property <string> stereo-text: "MO";
+    // True when the chip is in real stereo (used to colour the badge).
+    in-out property <bool> stereo-active: false;
     // Whether muted
     in-out property <bool> muted: false;
     // WiFi connection status
@@ -164,6 +181,63 @@ export component RadioWindow inherits MaterialWindow {
                         }
                     }
                 }
+
+                // Programme Type badge pinned to the top-right corner.
+                // Hidden when no PTY has been decoded so the card stays
+                // visually clean. Slightly rounded background so it reads
+                // as a Material "chip" without pulling in another import.
+                pty-chip := Rectangle {
+                    visible: root.pty-label != "";
+                    background: MaterialPalette.secondary-container;
+                    border-radius: 6px;
+                    width: pty-text.preferred-width + 8px;
+                    height: pty-text.preferred-height + 2px;
+                    x: parent.width - self.width - 6px;
+                    y: 4px;
+
+                    pty-text := MaterialText {
+                        text: root.pty-label;
+                        style: MaterialTypography.label-small;
+                        color: MaterialPalette.on-secondary-container;
+                        x: 4px;
+                        y: 1px;
+                    }
+                }
+            }
+
+            // Boot-time RSSI spectrum strip. One bar per bucket; the
+            // bucket currently being played is highlighted in the
+            // accent colour. Hidden when the sweep has not produced
+            // any data yet (e.g. very early boot or sweep failure).
+            Rectangle {
+                height: 28px;
+                background: MaterialPalette.surface-container-highest;
+                border-radius: 4px;
+                visible: root.spectrum.length > 0;
+
+                HorizontalLayout {
+                    padding: 2px;
+                    spacing: 1px;
+                    alignment: stretch;
+
+                    for value[idx] in root.spectrum: Rectangle {
+                        // Active vs idle colouring. The cursor turns the
+                        // bar primary so the user can locate the current
+                        // tuning point at a glance.
+                        background: idx == root.spectrum-cursor
+                            ? MaterialPalette.primary
+                            : MaterialPalette.tertiary;
+                        // Bar height tracks RSSI 0..=75 mapped onto the
+                        // strip height. Floor at 1 px so empty buckets
+                        // still show a baseline tick.
+                        height: max(1px, parent.height * min(value / 75.0, 1.0));
+                        // Anchor to the bottom edge so taller bars grow
+                        // upwards like a histogram.
+                        y: parent.height - self.height;
+                        border-radius: 1px;
+                        horizontal-stretch: 1;
+                    }
+                }
             }
 
             // Signal strength bar
@@ -179,10 +253,24 @@ export component RadioWindow inherits MaterialWindow {
                         color: MaterialPalette.on-surface-variant;
                     }
 
-                    MaterialText {
-                        text: root.rssi;
-                        style: MaterialTypography.label-small;
-                        color: MaterialPalette.on-surface;
+                    HorizontalLayout {
+                        spacing: 4px;
+
+                        // Stereo / Mono badge. Coloured `primary` for true
+                        // stereo, `outline` (muted) for mono / auto-mono.
+                        MaterialText {
+                            text: root.stereo-text;
+                            style: MaterialTypography.label-small;
+                            color: root.stereo-active
+                                ? MaterialPalette.primary
+                                : MaterialPalette.outline;
+                        }
+
+                        MaterialText {
+                            text: root.rssi;
+                            style: MaterialTypography.label-small;
+                            color: MaterialPalette.on-surface;
+                        }
                     }
                 }
 

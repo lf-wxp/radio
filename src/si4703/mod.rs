@@ -92,6 +92,8 @@ const SYS2_SPACE_MASK: u16 = 0x0030;
 const STATUS_RDSR: u16 = 1 << 15;
 const STATUS_STC: u16 = 1 << 14;
 const STATUS_SF_BL: u16 = 1 << 13;
+/// STATUSRSSI bit 8: receive mode (1 = stereo, 0 = mono).
+const STATUS_ST: u16 = 1 << 8;
 
 // READ_CHAN register bits
 const READCHAN_MASK: u16 = 0x03FF;
@@ -423,6 +425,37 @@ impl Si4703 {
     Ok((self.regs[REG_STATUS_RSSI] & 0x00FF) as u8)
   }
 
+  /// Read RSSI **and** the stereo-receive flag in a single I2C transaction.
+  ///
+  /// Equivalent to calling [`Si4703::rssi`] followed by [`Si4703::is_stereo`]
+  /// but cuts the I2C traffic in half — important on the 200 ms refresh
+  /// loop where every `read_registers` is ~3 ms of blocking I/O.
+  ///
+  /// Returns `(rssi, stereo)` where `rssi` is in the range 0..=75 and
+  /// `stereo` is `true` when the receiver is currently locked to a
+  /// stereo pilot tone.
+  pub fn rssi_stereo<I2C>(&mut self, i2c: &mut I2C) -> Result<(u8, bool), I2C::Error>
+  where
+    I2C: embedded_hal::i2c::I2c,
+  {
+    self.read_registers(i2c)?;
+    let rssi = (self.regs[REG_STATUS_RSSI] & 0x00FF) as u8;
+    let stereo = (self.regs[REG_STATUS_RSSI] & STATUS_ST) != 0;
+    Ok((rssi, stereo))
+  }
+
+  /// Whether the receiver is currently locked onto a stereo pilot tone.
+  ///
+  /// Triggers an I2C read of the STATUSRSSI register; prefer
+  /// [`Si4703::rssi_stereo`] when both values are needed.
+  pub fn is_stereo<I2C>(&mut self, i2c: &mut I2C) -> Result<bool, I2C::Error>
+  where
+    I2C: embedded_hal::i2c::I2c,
+  {
+    self.read_registers(i2c)?;
+    Ok((self.regs[REG_STATUS_RSSI] & STATUS_ST) != 0)
+  }
+
   /// Seek to the next station in the specified direction.
   ///
   /// Returns the frequency found (MHz * 10) or `None` if seek failed
@@ -517,6 +550,68 @@ impl Si4703 {
     }
 
     Ok(count)
+  }
+
+  /// Sweep the entire band, sampling RSSI at evenly-spaced points.
+  ///
+  /// Unlike [`scan_stations`], which uses the chip's hardware seek to
+  /// jump between detected carriers, this method **forces a tune to
+  /// every bucket**, giving a dense RSSI map suitable for drawing a
+  /// spectrum view of the FM band.
+  ///
+  /// The output buffer length determines the resolution: with `N`
+  /// buckets the band is divided into `N` equal slots from
+  /// `bottom_freq` to `top_freq`, and each `out[i]` receives the RSSI
+  /// reported by the chip immediately after tuning the centre of slot
+  /// `i`. RSSI is in the range `0..=75` (Si4703 hardware contract).
+  ///
+  /// # Cost
+  ///
+  /// Each bucket costs one `tune` (~60 ms STC wait) plus one
+  /// `read_registers` (~3 ms). For `N = 52` buckets that is about
+  /// 3.3 s of blocking I²C/I/O, which is fine for a one-shot boot-time
+  /// sweep but **not** suitable for a hot loop.
+  ///
+  /// The function never panics on a short buffer; it simply skips the
+  /// work when `out.is_empty()`.
+  ///
+  /// [`scan_stations`]: Si4703::scan_stations
+  pub async fn sweep_rssi<I2C>(&mut self, i2c: &mut I2C, out: &mut [u8]) -> Result<(), I2C::Error>
+  where
+    I2C: embedded_hal::i2c::I2c,
+  {
+    if out.is_empty() {
+      return Ok(());
+    }
+
+    let bottom = self.band.bottom_freq_mhz_x10();
+    let top = self.band.top_freq_mhz_x10();
+    // Inclusive span in 0.1 MHz units. Both bounds are < 1100, so the
+    // u16 subtraction is safe and the product fits in u32 well below
+    // overflow even for `out.len() == u16::MAX`.
+    let span_x10 = u32::from(top.saturating_sub(bottom));
+    let n = out.len() as u32;
+
+    for (i, slot) in out.iter_mut().enumerate() {
+      // Centre frequency of bucket `i`, computed as
+      //     bottom + span * (2i + 1) / (2N)
+      // i.e. the midpoint of slot `i` in floating-point space, but
+      // implemented in u32 arithmetic to avoid pulling in a softfloat
+      // library on a no_std target. The numerator stays under
+      // `span_x10 * 2N` < 2^17 for any reasonable N, so no overflow.
+      let mid = u32::from(bottom) + (span_x10 * (2 * i as u32 + 1)) / (2 * n);
+      let freq = (mid.min(u32::from(top))) as u16;
+      // A failed tune leaves the chip on the previous channel; record
+      // 0 for that bucket and continue so a single I²C glitch doesn't
+      // abort the whole sweep.
+      match self.tune(i2c, freq).await {
+        Ok(()) => {
+          *slot = self.rssi(i2c).unwrap_or(0);
+        }
+        Err(_) => *slot = 0,
+      }
+    }
+    Ok(())
   }
 
   /// Read RDS data if available.
@@ -691,6 +786,12 @@ pub struct RdsDecoder {
   /// [`RdsDecoder::take_clock_time`]. `None` until the first valid 4A
   /// group is decoded after construction or [`RdsDecoder::reset`].
   ct_pending: Option<RdsClockTime>,
+
+  /// Most recently observed Programme Type code (RBDS / RDS standard,
+  /// 0..=31). Lifted from bits 10..=6 of every RDS Block B, so it
+  /// stabilises within the first ~100 ms of tuning. `None` until the
+  /// first RDS group is seen for the current station.
+  pty: Option<u8>,
 }
 
 impl RdsDecoder {
@@ -705,6 +806,7 @@ impl RdsDecoder {
       rt_ab_flag: None,
       rt_complete: false,
       ct_pending: None,
+      pty: None,
     }
   }
 
@@ -716,6 +818,10 @@ impl RdsDecoder {
     // Group type is in bits 15-12 of block B; bit 11 is the version (0 = A, 1 = B)
     let group_type = (block_b >> 12) & 0x0F;
     let version_b = (block_b & 0x0800) != 0;
+
+    // Programme Type sits in bits 10..=6 of *every* Block B regardless of
+    // group, so the cheapest place to harvest it is right here.
+    self.pty = Some(((block_b >> 5) & 0x1F) as u8);
 
     match group_type {
       // Group 0A / 0B: Programme Service name (always 4 chars * 2 bytes)
@@ -834,6 +940,18 @@ impl RdsDecoder {
     decode_rds_text(self.radio_text_bytes())
   }
 
+  /// Convenience: human-readable Programme Type for the current station.
+  ///
+  /// Returns `None` until at least one RDS group has been decoded on the
+  /// current station, or when the broadcaster reports PTY 0 ("None").
+  pub fn pty_label(&self) -> Option<&'static str> {
+    let code = self.pty?;
+    if code == 0 {
+      return None;
+    }
+    Some(pty_label(code))
+  }
+
   /// True once the RT message terminator (`0x0D`) has been observed or all
   /// 16 segments have been received.
   pub fn radio_text_complete(&self) -> bool {
@@ -857,6 +975,15 @@ impl RdsDecoder {
     self.rt_ab_flag = None;
     self.rt_complete = false;
     self.ct_pending = None;
+    self.pty = None;
+  }
+
+  /// Most recently observed Programme Type (PTY) code, 0..=31.
+  ///
+  /// `None` until the first RDS group has been processed on the current
+  /// station. Use [`pty_label`] to map to a human-readable string.
+  pub fn pty(&self) -> Option<u8> {
+    self.pty
   }
 
   /// Internal Clock-Time decode (Group 4A).
@@ -912,6 +1039,51 @@ impl Default for RdsDecoder {
 // ============================================================================
 // Utility Functions
 // ============================================================================
+
+/// Map an RBDS / RDS Programme Type code (0..=31) to a short label.
+///
+/// Strings are kept short (≤ 8 ASCII chars) so they fit on the station
+/// card without truncation. Source: RBDS standard NRSC-4-B Annex F /
+/// IEC 62106 Table 9. Codes outside `0..=31` are clamped to `"--"` so
+/// callers can pass a raw `u8` without panicking on corrupted input.
+///
+/// PTY 0 is the broadcaster's way of saying "no programme type" and is
+/// therefore reported as `"None"`; UI code typically suppresses the
+/// badge entirely in that case.
+pub fn pty_label(code: u8) -> &'static str {
+  // RBDS labels (United States / Europe both use this table since 1998).
+  match code {
+    0 => "None",
+    1 => "News",
+    2 => "Info",
+    3 => "Sports",
+    4 => "Talk",
+    5 => "Rock",
+    6 => "ClsRock",
+    7 => "AdltHit",
+    8 => "SoftRck",
+    9 => "Top 40",
+    10 => "Country",
+    11 => "Oldies",
+    12 => "Soft",
+    13 => "Nostlga",
+    14 => "Jazz",
+    15 => "Classic",
+    16 => "R&B",
+    17 => "SoftR&B",
+    18 => "Lang",
+    19 => "RelMusc",
+    20 => "RelTalk",
+    21 => "Persnly",
+    22 => "Public",
+    23 => "College",
+    24..=28 => "Unassgn",
+    29 => "Weather",
+    30 => "Test",
+    31 => "Alert!",
+    _ => "--",
+  }
+}
 
 /// Format a frequency value (MHz * 10) into integer and decimal parts.
 ///
