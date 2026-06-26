@@ -993,3 +993,56 @@ async fn run_af_probe(
   publish_af_status(rds.alt_freqs().len() as u8, false).await;
   *last_tuned_pending = Some((target, Instant::now()));
 }
+
+// ============================================================================
+// Listening-log sampler
+// ============================================================================
+
+/// Periodically snapshot [`RADIO_STATE`] into the global
+/// [`crate::listening_log::LISTENING_LOG`] ring buffer.
+///
+/// Wakes every [`SAMPLE_INTERVAL_SECS`](crate::listening_log::SAMPLE_INTERVAL_SECS)
+/// seconds and only writes a new entry when the listener has actually
+/// moved (different frequency) or the broadcaster has rotated the PS
+/// station name. Without that gate the buffer would fill up with 360
+/// identical rows per hour on a stable station and the replay panel
+/// in the web console would lose its purpose.
+#[embassy_executor::task]
+pub async fn logger_task() -> ! {
+  use crate::listening_log::{LISTENING_LOG, SAMPLE_INTERVAL_SECS, capture};
+
+  let mut last_freq: u16 = 0;
+  let mut last_ps_first_byte: Option<u8> = None;
+
+  loop {
+    Timer::after(Duration::from_secs(SAMPLE_INTERVAL_SECS)).await;
+
+    // Take a snapshot under the radio-state lock; release before
+    // touching the log mutex so the two locks are never held
+    // simultaneously (defensive even though no other path takes both).
+    let (entry, freq, ps_first) = {
+      let state = RADIO_STATE.lock().await;
+      let uptime = (Instant::now().as_secs()) as u32;
+      let snap = capture(uptime, &state);
+      let ps_first = state.station_name.as_bytes().first().copied();
+      (snap, state.freq_mhz_x10, ps_first)
+    };
+
+    // Skip the very first sample if nothing meaningful is loaded yet
+    // (boot placeholder freq + empty PS would just pollute the log).
+    if entry.freq_x10 == 0 {
+      continue;
+    }
+
+    let changed = freq != last_freq || ps_first != last_ps_first_byte;
+    if !changed {
+      continue;
+    }
+
+    last_freq = freq;
+    last_ps_first_byte = ps_first;
+
+    let mut log = LISTENING_LOG.lock().await;
+    log.push(entry);
+  }
+}

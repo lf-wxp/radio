@@ -384,6 +384,7 @@ All endpoints live on port 80; bodies are JSON or empty.
 |--------|-----------------------|----------------------------|------------------------------------------------------------------------------|
 | GET    | `/`                   | —                          | Single-page HTML console.                                                    |
 | GET    | `/api/state`          | —                          | JSON snapshot: freq, RSSI, PS/RT/PTY/AF, mute, presets, WiFi.                |
+| GET    | `/api/log`            | —                          | JSON listening log — last 64 sampled entries (chronological).                |
 | POST   | `/api/tune`           | `{"freq_x10":1015}`         | Tune to 101.5 MHz; `400` outside `87.5–108.0`.                               |
 | POST   | `/api/tune/up`        | —                          | Nudge +0.1 MHz.                                                              |
 | POST   | `/api/tune/down`      | —                          | Nudge −0.1 MHz.                                                              |
@@ -465,6 +466,7 @@ recommended implementation sequence within each lane.
 - [x] RDS-AF alternative-frequency follow — PI-gated weak-signal probe
 - [x] LAN web console — phone-friendly single-page UI + JSON API on port 80
 - [x] mDNS responder — reach the console at `http://esp-radio.local/`
+- [x] Listening log — in-RAM rolling history of PS / RT / RSSI for the web replay panel
 - [x] mDNS responder — reach the console at `http://esp-radio.local/`
 
 ### 🚧 Planned (no extra hardware required)
@@ -483,7 +485,7 @@ working days.
 | ✅  | RDS-AF alternative-frequency follow                         | 2 d    | Group 0A block C parsed, PI gated; weak-signal probe ( ≤ 18 RSSI for 5 s) auto-hops to the strongest AF and rolls back if PI mismatches. Shipped 2026-06. |
 | 7   | LAN web console via `picoserve` (`/api/state`, `/api/tune`) | 2 d    | Tiny single-page HTML + JSON API; phone becomes a remote.                            |
 | ✅  | mDNS broadcast `esp-radio.local`                            | 1 d    | Passive A-record responder on `224.0.0.251:5353`; pairs with #7 so the user can browse `http://esp-radio.local/`. Shipped 2026-06. |
-| 9   | RDS listening log (rolling flash buffer of PS/RT/RSSI)      | 1 d    | Pure-text replay; no audio path needed.                                              |
+| ✅  | RDS listening log (rolling buffer of PS/RT/RSSI)            | 1 d    | 64-entry in-RAM ring buffer sampled every 10 s; rendered by the web console under "Listening log". Flash persistence intentionally deferred to keep #11's flash budget. Shipped 2026-06. |
 | 10  | BLE HID remote (selfie-shutter style)                       | 2–3 d  | `esp-radio` `ble` + `trouble-host` already in `Cargo.toml`; mind Wi-Fi/BLE coex.     |
 | 11  | OTA firmware update                                         | 5 d    | **Design complete**, implementation deferred → [docs/ota-design.md](./docs/ota-design.md). |
 

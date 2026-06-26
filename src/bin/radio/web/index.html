@@ -17,6 +17,7 @@
         --accent-strong: #3b82f6;
         --warn: #f59e0b;
         --err: #ef4444;
+        --border: #334155;
       }
       * {
         box-sizing: border-box;
@@ -171,6 +172,48 @@
         background: var(--accent-strong);
         color: white;
       }
+      /* Listening-log panel
+         - capped height + scroll so a full ring buffer doesn't push
+           the rest of the console below the fold on a phone.
+         - monospace freq column for easy column scanning. */
+      .log {
+        max-height: 12rem;
+        overflow-y: auto;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+        font-size: 0.85rem;
+        line-height: 1.35;
+      }
+      .log li {
+        display: grid;
+        grid-template-columns: 4.5rem 3.4rem 1fr;
+        gap: 0.4rem;
+        padding: 0.25rem 0;
+        border-bottom: 1px solid var(--border);
+      }
+      .log li:last-child {
+        border-bottom: 0;
+      }
+      .log .col-time {
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+      }
+      .log .col-freq {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-weight: 600;
+      }
+      .log .col-meta {
+        color: var(--text);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .log-empty {
+        color: var(--muted);
+        text-align: center;
+        padding: 1rem 0;
+      }
       .footer {
         font-size: 12px;
         color: var(--muted);
@@ -221,6 +264,15 @@
       </div>
       <div class="presets" id="presets"></div>
       <div class="err" id="err"></div>
+    </section>
+
+    <section class="card" aria-labelledby="logTitle">
+      <h2 id="logTitle" style="margin:0 0 .5rem;font-size:.95rem;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.05em;">
+        Listening log
+      </h2>
+      <ul class="log" id="log" aria-live="polite">
+        <li class="log-empty" id="logEmpty">No samples yet&hellip;</li>
+      </ul>
     </section>
 
     <div class="footer" id="footer">connecting&hellip;</div>
@@ -340,6 +392,66 @@
 
       refresh();
       setInterval(refresh, 1000);
+
+      // Listening log refresh — once every 5 s. The buffer only
+      // changes on PS / freq events, so polling more often would
+      // just churn DOM nodes for no visual benefit.
+      const fmtAgo = (deltaSecs) => {
+        if (deltaSecs < 60) return `${deltaSecs}s ago`;
+        const m = Math.floor(deltaSecs / 60);
+        const s = deltaSecs % 60;
+        return `${m}m${String(s).padStart(2, "0")}s`;
+      };
+
+      const refreshLog = async () => {
+        try {
+          const res = await fetch("/api/log");
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const data = await res.json();
+          const wrap = $("log");
+          wrap.innerHTML = "";
+          if (!data.entries.length) {
+            const li = document.createElement("li");
+            li.className = "log-empty";
+            li.textContent = "No samples yet\u2026";
+            wrap.appendChild(li);
+            return;
+          }
+          // Show newest first; the API returns oldest-first.
+          const reversed = data.entries.slice().reverse();
+          const newestUptime = reversed[0].uptime_secs;
+          for (const entry of reversed) {
+            const li = document.createElement("li");
+
+            const time = document.createElement("span");
+            time.className = "col-time";
+            const delta = Math.max(0, newestUptime - entry.uptime_secs);
+            time.textContent = fmtAgo(delta);
+
+            const freq = document.createElement("span");
+            freq.className = "col-freq";
+            const [fi, fd] = fmtFreq(entry.freq_x10);
+            freq.textContent = `${fi}.${fd}`;
+
+            const meta = document.createElement("span");
+            meta.className = "col-meta";
+            const psPart = entry.ps ? entry.ps.trim() : "";
+            const rtPart = entry.rt ? entry.rt.trim() : "";
+            meta.textContent = [psPart, rtPart].filter(Boolean).join(" \u00b7 ");
+            meta.title = meta.textContent;
+
+            li.appendChild(time);
+            li.appendChild(freq);
+            li.appendChild(meta);
+            wrap.appendChild(li);
+          }
+        } catch (e) {
+          $("err").textContent = `log: ${e.message}`;
+        }
+      };
+
+      refreshLog();
+      setInterval(refreshLog, 5000);
     </script>
   </body>
 </html>

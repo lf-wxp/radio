@@ -49,6 +49,12 @@
 #![no_std]
 #![no_main]
 #![feature(impl_trait_in_assoc_type)]
+// picoserve's `Router` type is a fluent chain of generics — each
+// `.route(...)` call wraps the previous one, so the layout-of query
+// for `web_task`'s task pool nests once per route. With #9 we now
+// have nine routes; the default 128-step recursion limit is too
+// shallow for rustc's layout solver in release mode.
+#![recursion_limit = "256"]
 #![deny(
   clippy::mem_forget,
   reason = "mem::forget is generally not safe to do with esp_hal types, especially those \
@@ -59,6 +65,7 @@
 extern crate alloc;
 
 mod hardware;
+mod listening_log;
 mod mdns;
 mod presets;
 mod state;
@@ -354,6 +361,12 @@ async fn main(spawner: Spawner) -> ! {
     tasks::radio_control_task(radio_chip, i2c, preset_store)
       .expect("create radio_control_task token"),
   );
+  // Listening-log sampler: pure software task that snapshots
+  // RADIO_STATE every 10 s into the in-RAM ring buffer for the
+  // web console's replay panel.
+  if let Err(e) = spawner.spawn(tasks::logger_task()) {
+    info!("Failed to spawn logger_task: {:?} — log disabled", e);
+  }
 
   // Tiny pause to let tasks initialise before we monopolise the executor.
   Timer::after(Duration::from_millis(10)).await;

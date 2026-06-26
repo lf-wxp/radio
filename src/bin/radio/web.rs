@@ -43,11 +43,13 @@ const HTTP_BUFFER_SIZE: usize = 2048;
 
 /// Per-connection TCP rx/tx buffer sizes.
 ///
-/// 1 KiB each is enough for a single short request + response with
-/// keep-alive disabled; the HTML page is streamed via the http buffer
-/// so the TCP buffer doesn't need to hold the whole body.
+/// 1 KiB rx is enough for a single short request. tx is bumped to 4 KiB
+/// because `GET /api/log` returns up to [`crate::listening_log::LOG_CAPACITY`]
+/// entries, each ~110 B of JSON, which can total ~7 KiB. picoserve
+/// streams the response in chunks but the underlying smoltcp tx ring
+/// must be at least one MSS to avoid stalling.
 const TCP_RX_BUFFER_SIZE: usize = 1024;
-const TCP_TX_BUFFER_SIZE: usize = 1024;
+const TCP_TX_BUFFER_SIZE: usize = 4096;
 
 // ============================================================================
 // JSON DTOs
@@ -80,6 +82,30 @@ struct StateDto {
   presets: [u16; crate::state::MAX_PRESETS],
   wifi_ssid: alloc::string::String,
   wifi_connected: bool,
+}
+
+/// One row in the `GET /api/log` response.
+///
+/// Mirrors [`crate::listening_log::LogEntry`] but with owned strings
+/// so the listening-log mutex is released before serialisation, and
+/// with the field names the front-end JS expects.
+#[derive(Serialize)]
+struct LogEntryDto {
+  /// Boot-relative seconds; the front-end converts this to `mm:ss ago`.
+  uptime_secs: u32,
+  freq_x10: u16,
+  rssi: u8,
+  ps: alloc::string::String,
+  rt: alloc::string::String,
+}
+
+/// Wrapper for `GET /api/log`. Wrapping the array in an object keeps
+/// us free to add more top-level fields (capacity, head index, etc.)
+/// without breaking the JSON contract with the browser.
+#[derive(Serialize)]
+struct LogDto {
+  capacity: u16,
+  entries: alloc::vec::Vec<LogEntryDto>,
 }
 /// Body for `POST /api/tune`.
 #[derive(Deserialize)]
@@ -121,6 +147,7 @@ impl AppBuilder for AppProps {
         }),
       )
       .route("/api/state", get(handle_get_state))
+      .route("/api/log", get(handle_get_log))
       .route("/api/tune", post(handle_post_tune))
       .route("/api/tune/up", post(handle_post_tune_up))
       .route("/api/tune/down", post(handle_post_tune_down))
@@ -163,6 +190,30 @@ async fn handle_get_state() -> picoserve::response::Json<StateDto> {
     wifi_connected: state.wifi_connected,
   };
   picoserve::response::Json(dto)
+}
+
+/// `GET /api/log` — return the full listening-log ring buffer in
+/// chronological order (oldest first).
+///
+/// The browser reverses the array client-side so the most recent
+/// entry sits at the top of the panel; doing the reverse here would
+/// just waste cycles.
+async fn handle_get_log() -> picoserve::response::Json<LogDto> {
+  let log = crate::listening_log::LISTENING_LOG.lock().await;
+  let entries: alloc::vec::Vec<LogEntryDto> = log
+    .iter_chronological()
+    .map(|e| LogEntryDto {
+      uptime_secs: e.uptime_secs,
+      freq_x10: e.freq_x10,
+      rssi: e.rssi,
+      ps: alloc::string::String::from(e.ps_str()),
+      rt: alloc::string::String::from(e.rt_str()),
+    })
+    .collect();
+  picoserve::response::Json(LogDto {
+    capacity: crate::listening_log::LOG_CAPACITY as u16,
+    entries,
+  })
 }
 
 /// `POST /api/tune` \u2014 jump to an exact frequency.
