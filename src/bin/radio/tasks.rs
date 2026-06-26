@@ -20,8 +20,9 @@ use radio::si4703::{RdsClockTime, RdsDecoder, SeekDirection, Si4703};
 use crate::presets::PresetStore;
 use crate::state::{
   DEFAULT_FREQ_X10, INPUT_CMDS, LAST_TUNED_DEBOUNCE_MS, LONG_PRESS_MS, RADIO_STATE, RadioCommand,
-  STATION_NAME_PLACEHOLDER, TUNE_STEP_X10, ULTRA_LONG_PRESS_MS, clamp_freq, publish_clock,
-  publish_freq, publish_presets, publish_pty, publish_radio_text, publish_station_name,
+  STATION_NAME_PLACEHOLDER, TUNE_STEP_X10, ULTRA_LONG_PRESS_MS, clamp_freq, publish_af_status,
+  publish_clock, publish_freq, publish_presets, publish_pty, publish_radio_text,
+  publish_station_name,
 };
 
 /// Tracks wall-clock time derived from RDS Group 4A (Clock-Time).
@@ -160,6 +161,87 @@ impl MonoController {
   }
 }
 
+/// Decision-only controller for RDS-AF (Alternative Frequency) follow.
+///
+/// The actual probe (tune → measure RSSI → verify PI → commit / rollback)
+/// is implemented in [`run_af_probe`] because it needs the chip + I2C
+/// bus. This struct only decides *when* a probe is allowed:
+///
+/// 1. **Sustained weak signal** — RSSI must stay `≤ RSSI_WEAK` for at
+///    least [`Self::WEAK_DWELL_TICKS`] consecutive 200 ms ticks. The
+///    threshold is intentionally lower than [`MonoController::RSSI_LOW`]
+///    so the auto-mono blend gets a chance to recover the listen first;
+///    we only escalate to AF when even mono sounds bad.
+/// 2. **Cooldown** — after every probe attempt (success or failure),
+///    we refuse to probe again for [`Self::COOLDOWN_TICKS`] ticks. This
+///    keeps a flapping signal from causing rapid back-to-back hiccups.
+///
+/// All thresholds are tick-counted so we don't need wall-clock
+/// arithmetic; the radio control task ticks at a steady 5 Hz.
+struct AfFollower {
+  /// Consecutive ticks observed below [`Self::RSSI_WEAK`].
+  weak_dwell: u8,
+  /// Remaining cooldown ticks after the last probe attempt.
+  cooldown: u16,
+}
+
+impl AfFollower {
+  /// RSSI ≤ this is considered "weak enough to try AF".
+  ///
+  /// Below the auto-mono engage threshold (25): we only escalate to a
+  /// disruptive frequency probe when the cheaper mono blend has already
+  /// failed to make the audio comfortable.
+  const RSSI_WEAK: u8 = 18;
+  /// 5 s of sustained weak signal before probing (5 Hz × 25 = 5 s).
+  const WEAK_DWELL_TICKS: u8 = 25;
+  /// 30 s cool-down after each probe attempt (5 Hz × 150 = 30 s).
+  const COOLDOWN_TICKS: u16 = 150;
+  /// Probe candidate is only adopted if its RSSI exceeds the current
+  /// frequency's RSSI by at least this much (anti-flap hysteresis).
+  const RSSI_IMPROVE_MARGIN: u8 = 6;
+
+  const fn new() -> Self {
+    Self {
+      weak_dwell: 0,
+      cooldown: 0,
+    }
+  }
+
+  /// Tick the controller with the current RSSI.
+  ///
+  /// Returns `true` when the caller should run a probe. The follower
+  /// internally arms its cooldown when it returns `true`, so the caller
+  /// can rely on "only one probe per signal-loss event".
+  fn observe(&mut self, rssi: u8, af_list_len: usize) -> bool {
+    if self.cooldown > 0 {
+      self.cooldown -= 1;
+      // Don't accumulate dwell during cooldown either, so the next
+      // probe waits for a fresh weak streak rather than firing the
+      // moment the cooldown expires.
+      self.weak_dwell = 0;
+      return false;
+    }
+
+    if rssi > Self::RSSI_WEAK {
+      self.weak_dwell = 0;
+      return false;
+    }
+
+    // RSSI is weak. Count up; gate on having a usable AF list (no point
+    // probing if no candidates are known).
+    self.weak_dwell = self.weak_dwell.saturating_add(1);
+    if self.weak_dwell < Self::WEAK_DWELL_TICKS || af_list_len == 0 {
+      return false;
+    }
+
+    // Trigger! Arm the cooldown and reset dwell so we don't fire again
+    // immediately even if the probe is a no-op.
+    self.cooldown = Self::COOLDOWN_TICKS;
+    self.weak_dwell = 0;
+    true
+  }
+}
+
 /// Mutable per-tick state shared between [`refresh_status`] invocations.
 ///
 /// Bundled into one struct so the function signature stays under clippy's
@@ -172,6 +254,7 @@ struct RefreshContext<'a> {
   i2c_error_count: &'a mut u32,
   wall_clock: &'a mut Option<WallClock>,
   mono_ctl: &'a mut MonoController,
+  af_ctl: &'a mut AfFollower,
 }
 
 // ============================================================================
@@ -354,6 +437,9 @@ pub async fn radio_control_task(
   // Auto-mono hysteresis controller. See [`MonoController`] for the
   // exact thresholds; lifted out so its state survives across ticks.
   let mut mono_ctl = MonoController::new();
+  // RDS-AF (Alternative Frequency) follower. Decision-only; the actual
+  // probe runs in [`run_af_probe`] when this controller arms.
+  let mut af_ctl = AfFollower::new();
   // Tracks the most recent tune that hasn't yet been persisted.
   // `Some(instant)` means "we owe flash a `last_tuned` write"; when the
   // instant is older than `LAST_TUNED_DEBOUNCE_MS` we flush it.
@@ -379,15 +465,32 @@ pub async fn radio_control_task(
         .await;
       }
       Either::Second(_) => {
-        let mut ctx = RefreshContext {
-          rds: &mut rds,
-          last_rds_name: &mut last_rds_name,
-          last_rds_text: &mut last_rds_text,
-          i2c_error_count: &mut i2c_error_count,
-          wall_clock: &mut wall_clock,
-          mono_ctl: &mut mono_ctl,
+        let probe_armed = {
+          let mut ctx = RefreshContext {
+            rds: &mut rds,
+            last_rds_name: &mut last_rds_name,
+            last_rds_text: &mut last_rds_text,
+            i2c_error_count: &mut i2c_error_count,
+            wall_clock: &mut wall_clock,
+            mono_ctl: &mut mono_ctl,
+            af_ctl: &mut af_ctl,
+          };
+          refresh_status(&mut radio_chip, &mut i2c, &mut ctx).await
         };
-        refresh_status(&mut radio_chip, &mut i2c, &mut ctx).await;
+        // AF probe is intentionally outside the refresh borrow scope:
+        // it issues its own I2C tunes, so the per-tick `RefreshContext`
+        // borrow has to be released first.
+        if probe_armed {
+          run_af_probe(
+            &mut radio_chip,
+            &mut i2c,
+            &mut rds,
+            &mut wall_clock,
+            &mut preset_store,
+            &mut last_tuned_pending,
+          )
+          .await;
+        }
         // Opportunistic flash flush: piggy-back on the 200 ms tick
         // instead of a third `select` arm. Worst-case latency is one
         // tick beyond the debounce window, which is fine.
@@ -421,6 +524,38 @@ fn flush_last_tuned_if_due(store: &mut PresetStore<'static>, pending: &mut Optio
   *pending = None;
 }
 
+/// Common tail of a successful chip-side tune.
+///
+/// Resets RDS state for the new station, publishes the fresh frequency
+/// and cleared placeholders to [`RADIO_STATE`], updates the preset
+/// indicator only when the active slot actually changes, and arms the
+/// flash debounce. Shared by every code path that issues a successful
+/// `Si4703::tune` (manual rotary, web console, preset cycle, AF probe).
+async fn apply_tuned(
+  rds: &mut RdsDecoder,
+  wall_clock: &mut Option<WallClock>,
+  preset_store: &PresetStore<'static>,
+  last_tuned_pending: &mut Option<(u16, Instant)>,
+  freq_x10: u16,
+) {
+  rds.reset();
+  *wall_clock = None;
+  publish_freq(freq_x10).await;
+  publish_station_name(String::from(STATION_NAME_PLACEHOLDER)).await;
+  publish_radio_text(String::new()).await;
+  publish_clock(None).await;
+  publish_pty(None).await;
+  // Only update preset indicator when the active slot actually changes
+  // (e.g. tuning away from a saved frequency). This avoids acquiring
+  // the state lock on every rotary tick during fast tuning.
+  let new_idx = preset_store.snapshot().position(freq_x10).map(|i| i as u8);
+  let old_idx = RADIO_STATE.lock().await.preset_idx;
+  if new_idx != old_idx {
+    publish_presets(preset_store.snapshot(), freq_x10).await;
+  }
+  *last_tuned_pending = Some((freq_x10, Instant::now()));
+}
+
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -450,22 +585,14 @@ async fn handle_command(
       let next = clamp_freq(i32::from(current) + i32::from(steps_x10));
       info!("Tune: {} -> {}", current, next);
       if radio_chip.tune(i2c, next).await.is_ok() {
-        rds.reset();
-        *wall_clock = None;
-        publish_freq(next).await;
-        publish_station_name(String::from(STATION_NAME_PLACEHOLDER)).await;
-        publish_radio_text(String::new()).await;
-        publish_clock(None).await;
-        publish_pty(None).await;
-        // Only update preset indicator when the active slot actually
-        // changes (e.g. tuning away from a saved frequency). This avoids
-        // acquiring the state lock on every rotary tick during fast tuning.
-        let new_idx = preset_store.snapshot().position(next).map(|i| i as u8);
-        let old_idx = RADIO_STATE.lock().await.preset_idx;
-        if new_idx != old_idx {
-          publish_presets(preset_store.snapshot(), next).await;
-        }
-        *last_tuned_pending = Some((next, Instant::now()));
+        apply_tuned(rds, wall_clock, preset_store, last_tuned_pending, next).await;
+      }
+    }
+    RadioCommand::TuneAbsolute(freq_x10) => {
+      let target = clamp_freq(i32::from(freq_x10));
+      info!("Tune (abs): -> {}", target);
+      if radio_chip.tune(i2c, target).await.is_ok() {
+        apply_tuned(rds, wall_clock, preset_store, last_tuned_pending, target).await;
       }
     }
     RadioCommand::ToggleMute => {
@@ -574,7 +701,7 @@ async fn refresh_status(
   radio_chip: &mut Si4703,
   i2c: &mut I2c<'static, esp_hal::Blocking>,
   ctx: &mut RefreshContext<'_>,
-) {
+) -> bool {
   let (rssi, stereo) = match radio_chip.rssi_stereo(i2c) {
     Ok(v) => {
       *ctx.i2c_error_count = 0;
@@ -664,6 +791,205 @@ async fn refresh_status(
   if state.pty_label != pty_snapshot {
     state.pty_label = pty_snapshot;
   }
+  // Snapshot the current AF list size for the UI badge. Always
+  // reflects the *current* station; cleared on station change because
+  // `RdsDecoder::reset` wipes the AF list.
+  let af_count = ctx.rds.alt_freqs().len() as u8;
+  if state.af_count != af_count {
+    state.af_count = af_count;
+  }
   state.volume = radio_chip.volume();
   state.dirty = true;
+  drop(state);
+
+  // Decide whether the AF follower wants us to launch a probe this tick.
+  // Done last so all I2C reads above complete before we hand the bus
+  // to the (potentially long-running) probe routine.
+  ctx.af_ctl.observe(rssi, af_count as usize)
+}
+
+/// Maximum number of AF candidates we'll probe in one cycle.
+///
+/// Bounded so a malicious or buggy broadcaster can't pin the radio
+/// off-frequency for an unbounded duration. Real RDS lists are usually
+/// 1–5 entries; 8 is a safe ceiling that still completes in under ~1.5 s
+/// of audible silence even on slow STC.
+const AF_PROBE_LIMIT: usize = 8;
+
+/// Per-AF settle delay before sampling RSSI, in milliseconds.
+///
+/// The Si4703 STC flag clears within ~60 ms of a tune, but RSSI takes
+/// another ~80–100 ms to stabilise on the new carrier. 120 ms is the
+/// shortest delay that gives reproducible numbers in bench testing.
+const AF_SETTLE_MS: u64 = 120;
+
+/// Maximum time we'll wait for the PI code to reappear on a candidate
+/// frequency before declaring "this is not the same programme".
+///
+/// RDS group repetition rate is ~10 groups/s so a healthy broadcaster
+/// re-emits Block A roughly every 100 ms. 800 ms of polling gives us
+/// 8 chances and rejects dead carriers without dragging probe latency.
+const AF_PI_VERIFY_MS: u64 = 800;
+
+/// Probe the AF list and switch to a stronger candidate if one carries
+/// the same Programme Identification (PI) code as the original station.
+///
+/// **Audible side-effect**: this routine briefly tunes off the original
+/// frequency, which sounds like a half-second of silence followed by
+/// either renewed audio (success) or a return to the original carrier
+/// (probe failed / rejected). The [`AfFollower`] gates this so it only
+/// happens after sustained signal loss; real-world cadence is at most
+/// once every 30 s on a marginal station.
+#[allow(
+  clippy::large_stack_frames,
+  reason = "async state machine of run_af_probe holds the candidates buffer \
+            (16 B), the verify-loop's RDS read tuple, and several transient \
+            String allocations for publish_* calls; ~2.3 KiB total is \
+            negligible against the 16 KiB Embassy task stack on ESP32-C6, \
+            and the routine fires at most once every 30 s by design."
+)]
+async fn run_af_probe(
+  radio_chip: &mut Si4703,
+  i2c: &mut I2c<'static, esp_hal::Blocking>,
+  rds: &mut RdsDecoder,
+  wall_clock: &mut Option<WallClock>,
+  preset_store: &mut PresetStore<'static>,
+  last_tuned_pending: &mut Option<(u16, Instant)>,
+) {
+  // Snapshot the AF list and PI *before* we touch the chip — the very
+  // first off-frequency tune below will reset RDS state and wipe both.
+  let original_freq = match radio_chip.current_frequency(i2c) {
+    Ok(f) => f,
+    Err(_) => {
+      info!("AF probe: aborted (cannot read current frequency)");
+      return;
+    }
+  };
+  let Some(original_pi) = rds.pi() else {
+    info!("AF probe: aborted (no PI cached for original station)");
+    return;
+  };
+  let mut candidates = [0u16; AF_PROBE_LIMIT];
+  let candidate_count = {
+    let src = rds.alt_freqs();
+    let mut n = 0;
+    for &freq in src {
+      if n == AF_PROBE_LIMIT {
+        break;
+      }
+      // Skip the original frequency itself — some broadcasters list
+      // their own carrier, which would result in a no-op probe.
+      if freq == original_freq {
+        continue;
+      }
+      candidates[n] = freq;
+      n += 1;
+    }
+    n
+  };
+  if candidate_count == 0 {
+    info!("AF probe: aborted (no candidates after filtering original)");
+    return;
+  }
+
+  info!(
+    "AF probe: start (orig={} PI=0x{:04x} candidates={})",
+    original_freq, original_pi, candidate_count
+  );
+  publish_af_status(rds.alt_freqs().len() as u8, true).await;
+
+  // Phase 1: sweep candidates and pick the strongest.
+  let mut best_freq: Option<u16> = None;
+  let mut best_rssi: u8 = 0;
+  // Re-read the original RSSI immediately so the comparison is
+  // contemporaneous (signal levels can move several units in 200 ms).
+  let original_rssi = radio_chip.rssi(i2c).unwrap_or(0);
+  for &freq in &candidates[..candidate_count] {
+    if radio_chip.tune(i2c, freq).await.is_err() {
+      info!("AF probe: tune({}) failed, skipping", freq);
+      continue;
+    }
+    Timer::after(Duration::from_millis(AF_SETTLE_MS)).await;
+    let rssi = radio_chip.rssi(i2c).unwrap_or(0);
+    info!("AF probe: candidate {} RSSI={}", freq, rssi);
+    if rssi > best_rssi {
+      best_rssi = rssi;
+      best_freq = Some(freq);
+    }
+  }
+
+  // Phase 2: decide. Require a meaningful improvement so we don't
+  // burn an audible hiccup for marginal RSSI gains.
+  let Some(target) = best_freq
+    .filter(|_| best_rssi >= original_rssi.saturating_add(AfFollower::RSSI_IMPROVE_MARGIN))
+  else {
+    info!(
+      "AF probe: no improvement (best_rssi={} orig_rssi={}); rolling back",
+      best_rssi, original_rssi
+    );
+    if radio_chip.tune(i2c, original_freq).await.is_err() {
+      info!("AF probe: rollback tune failed!");
+    }
+    publish_af_status(rds.alt_freqs().len() as u8, false).await;
+    return;
+  };
+
+  // Phase 3: commit — land on the candidate, wait for the new station's
+  // RDS to deliver a PI, and verify it matches before we publish.
+  if radio_chip.tune(i2c, target).await.is_err() {
+    info!("AF probe: final tune({}) failed, rolling back", target);
+    let _ = radio_chip.tune(i2c, original_freq).await;
+    publish_af_status(rds.alt_freqs().len() as u8, false).await;
+    return;
+  }
+
+  // Reset the decoder so the next `read_rds` populates state fresh
+  // for the (potentially) new station; the original AF list is
+  // discarded along with PS/RT to avoid stale UI strings.
+  rds.reset();
+  *wall_clock = None;
+
+  // Poll for a PI on the new frequency. We accept any block whose PI
+  // matches the original; any other PI — or a verify timeout — means
+  // the AF entry was lying or the carrier is silent, so we roll back.
+  let verify_deadline = Instant::now() + Duration::from_millis(AF_PI_VERIFY_MS);
+  let mut verified = false;
+  while Instant::now() < verify_deadline {
+    if let Ok(Some((a, b, c, d))) = radio_chip.read_rds(i2c) {
+      rds.process(a, b, c, d);
+      if rds.pi() == Some(original_pi) {
+        verified = true;
+        break;
+      }
+    }
+    Timer::after(Duration::from_millis(60)).await;
+  }
+
+  if !verified {
+    info!(
+      "AF probe: PI mismatch on {} (expected 0x{:04x}, got {:?}); rolling back",
+      target,
+      original_pi,
+      rds.pi()
+    );
+    rds.reset();
+    let _ = radio_chip.tune(i2c, original_freq).await;
+    publish_af_status(rds.alt_freqs().len() as u8, false).await;
+    return;
+  }
+
+  // Success path: publish the new frequency the same way handle_command
+  // does after a manual tune so the UI / preset indicator stay coherent.
+  info!(
+    "AF probe: switched {} -> {} (RSSI {} -> {})",
+    original_freq, target, original_rssi, best_rssi
+  );
+  publish_freq(target).await;
+  publish_station_name(String::from(STATION_NAME_PLACEHOLDER)).await;
+  publish_radio_text(String::new()).await;
+  publish_clock(None).await;
+  publish_pty(None).await;
+  publish_presets(preset_store.snapshot(), target).await;
+  publish_af_status(rds.alt_freqs().len() as u8, false).await;
+  *last_tuned_pending = Some((target, Instant::now()));
 }

@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1" />
+    <meta name="theme-color" content="#0f172a" />
+    <title>ESP-Radio</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0f172a;
+        --card: #1e293b;
+        --card2: #0b1220;
+        --fg: #e2e8f0;
+        --muted: #94a3b8;
+        --accent: #60a5fa;
+        --accent-strong: #3b82f6;
+        --warn: #f59e0b;
+        --err: #ef4444;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        font: 16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+        background: var(--bg);
+        color: var(--fg);
+        padding: 16px;
+        max-width: 480px;
+        margin: 0 auto;
+      }
+      h1 {
+        font-size: 14px;
+        font-weight: 600;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        margin: 0 0 12px;
+      }
+      .card {
+        background: var(--card);
+        border-radius: 12px;
+        padding: 16px;
+        margin-bottom: 12px;
+      }
+      .freq {
+        font-size: 56px;
+        font-weight: 700;
+        color: var(--accent);
+        text-align: center;
+        line-height: 1;
+        font-variant-numeric: tabular-nums;
+      }
+      .freq small {
+        font-size: 18px;
+        color: var(--muted);
+        font-weight: 500;
+        margin-left: 6px;
+      }
+      .station {
+        text-align: center;
+        margin-top: 8px;
+      }
+      .station .name {
+        font-size: 18px;
+        font-weight: 600;
+      }
+      .station .rt {
+        font-size: 13px;
+        color: var(--muted);
+        margin-top: 4px;
+        min-height: 1em;
+        word-break: break-word;
+      }
+      .badges {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+        justify-content: center;
+        margin-top: 8px;
+        font-size: 12px;
+      }
+      .badge {
+        padding: 2px 8px;
+        border-radius: 999px;
+        background: var(--card2);
+        color: var(--muted);
+      }
+      .badge.on {
+        background: var(--accent-strong);
+        color: white;
+      }
+      .meter {
+        height: 6px;
+        background: var(--card2);
+        border-radius: 3px;
+        overflow: hidden;
+        margin-top: 12px;
+      }
+      .meter > span {
+        display: block;
+        height: 100%;
+        background: var(--accent);
+        width: 0%;
+        transition: width 0.2s;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+      }
+      .grid.three {
+        grid-template-columns: 1fr 1fr 1fr;
+      }
+      button {
+        appearance: none;
+        border: 0;
+        font: inherit;
+        background: var(--card2);
+        color: var(--fg);
+        border-radius: 10px;
+        padding: 12px 8px;
+        min-height: 44px;
+        cursor: pointer;
+        font-weight: 600;
+      }
+      button:active {
+        background: var(--accent-strong);
+      }
+      button.primary {
+        background: var(--accent-strong);
+      }
+      button.danger {
+        background: var(--err);
+      }
+      button[disabled] {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+      input[type="number"] {
+        width: 100%;
+        font: inherit;
+        background: var(--card2);
+        color: var(--fg);
+        border: 1px solid #334155;
+        border-radius: 10px;
+        padding: 10px 12px;
+        font-variant-numeric: tabular-nums;
+      }
+      .row {
+        display: flex;
+        gap: 8px;
+        margin-top: 8px;
+      }
+      .row > * {
+        flex: 1;
+      }
+      .presets {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 6px;
+        margin-top: 8px;
+      }
+      .presets button {
+        padding: 8px 4px;
+        font-size: 13px;
+        font-variant-numeric: tabular-nums;
+      }
+      .presets button.active {
+        background: var(--accent-strong);
+        color: white;
+      }
+      .footer {
+        font-size: 12px;
+        color: var(--muted);
+        text-align: center;
+        margin-top: 16px;
+      }
+      .err {
+        color: var(--err);
+        font-size: 12px;
+        text-align: center;
+        min-height: 1em;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>ESP-Radio</h1>
+
+    <section class="card">
+      <div class="freq">
+        <span id="freqInt">--</span>.<span id="freqDec">-</span><small>MHz</small>
+      </div>
+      <div class="station">
+        <div class="name" id="stationName">--------</div>
+        <div class="rt" id="radioText"></div>
+      </div>
+      <div class="badges">
+        <span class="badge" id="bStereo">MO</span>
+        <span class="badge" id="bPty" hidden></span>
+        <span class="badge" id="bAf" hidden></span>
+        <span class="badge" id="bClock" hidden></span>
+      </div>
+      <div class="meter" aria-label="signal strength"><span id="rssiBar"></span></div>
+    </section>
+
+    <section class="card">
+      <div class="grid three">
+        <button id="btnDown" aria-label="tune down 0.1 MHz">&minus;0.1</button>
+        <button id="btnCycle" class="primary" aria-label="cycle preset">Preset &rarr;</button>
+        <button id="btnUp" aria-label="tune up 0.1 MHz">+0.1</button>
+      </div>
+      <div class="row">
+        <input id="freqInput" type="number" inputmode="decimal" step="0.1" min="87.5" max="108.0" placeholder="e.g. 96.5" />
+        <button id="btnTune" class="primary">Tune</button>
+      </div>
+      <div class="row">
+        <button id="btnSave">Save preset</button>
+        <button id="btnMute" class="danger">Mute</button>
+      </div>
+      <div class="presets" id="presets"></div>
+      <div class="err" id="err"></div>
+    </section>
+
+    <div class="footer" id="footer">connecting&hellip;</div>
+
+    <script>
+      const $ = (id) => document.getElementById(id);
+
+      const post = async (path, body) => {
+        const opts = { method: "POST" };
+        if (body !== undefined) {
+          opts.headers = { "content-type": "application/json" };
+          opts.body = JSON.stringify(body);
+        }
+        try {
+          const res = await fetch(path, opts);
+          if (!res.ok) {
+            $("err").textContent = `${path}: HTTP ${res.status}`;
+          } else {
+            $("err").textContent = "";
+            // Eager refresh so the user sees immediate feedback rather
+            // than waiting for the next 1 s poll tick.
+            refresh();
+          }
+        } catch (e) {
+          $("err").textContent = `${path}: ${e.message}`;
+        }
+      };
+
+      $("btnUp").addEventListener("click", () => post("/api/tune/up"));
+      $("btnDown").addEventListener("click", () => post("/api/tune/down"));
+      $("btnCycle").addEventListener("click", () => post("/api/preset/cycle"));
+      $("btnSave").addEventListener("click", () => post("/api/preset/save"));
+      $("btnMute").addEventListener("click", () => post("/api/mute"));
+
+      $("btnTune").addEventListener("click", () => {
+        const raw = parseFloat($("freqInput").value);
+        if (!Number.isFinite(raw) || raw < 87.5 || raw > 108.0) {
+          $("err").textContent = "Frequency must be 87.5\u2013108.0 MHz";
+          return;
+        }
+        // Round to nearest 0.1 MHz to match the chip's tuning granularity.
+        const x10 = Math.round(raw * 10);
+        post("/api/tune", { freq_x10: x10 });
+      });
+
+      const fmtFreq = (x10) => {
+        const i = Math.floor(x10 / 10);
+        const d = x10 % 10;
+        return [i, d];
+      };
+
+      const setBadge = (el, text, on) => {
+        if (!text) {
+          el.hidden = true;
+          return;
+        }
+        el.hidden = false;
+        el.textContent = text;
+        el.classList.toggle("on", !!on);
+      };
+
+      const refresh = async () => {
+        try {
+          const res = await fetch("/api/state");
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const s = await res.json();
+
+          const [fi, fd] = fmtFreq(s.freq_x10);
+          $("freqInt").textContent = fi;
+          $("freqDec").textContent = fd;
+
+          $("stationName").textContent = s.station_name || "--------";
+          $("radioText").textContent = s.radio_text || "";
+
+          const stereoText = s.auto_mono ? "MO*" : s.stereo ? "ST" : "MO";
+          setBadge($("bStereo"), stereoText, s.stereo && !s.auto_mono);
+          setBadge($("bPty"), s.pty_label || "", true);
+          setBadge(
+            $("bAf"),
+            s.af_following ? "AF\u2192" : s.af_count > 0 ? `AF\u00b7${s.af_count}` : "",
+            s.af_following,
+          );
+          setBadge($("bClock"), s.clock || "", false);
+
+          const rssiPct = Math.min(100, Math.round((s.rssi / 75) * 100));
+          $("rssiBar").style.width = rssiPct + "%";
+
+          $("btnMute").textContent = s.muted ? "Unmute" : "Mute";
+
+          // Render the preset chip strip. Empty slots get a disabled
+          // placeholder so the layout is stable across saves.
+          const wrap = $("presets");
+          wrap.innerHTML = "";
+          s.presets.forEach((freq, idx) => {
+            const btn = document.createElement("button");
+            if (freq === 0) {
+              btn.textContent = "\u00b7";
+              btn.disabled = true;
+            } else {
+              const [pi, pd] = fmtFreq(freq);
+              btn.textContent = `${pi}.${pd}`;
+              if (s.preset_idx === idx) btn.classList.add("active");
+              btn.addEventListener("click", () =>
+                post("/api/tune", { freq_x10: freq }),
+              );
+            }
+            wrap.appendChild(btn);
+          });
+
+          $("footer").textContent = s.wifi_connected
+            ? `${s.wifi_ssid} \u2022 vol ${s.volume}/15`
+            : "WiFi offline";
+        } catch (e) {
+          $("err").textContent = `state: ${e.message}`;
+        }
+      };
+
+      refresh();
+      setInterval(refresh, 1000);
+    </script>
+  </body>
+</html>

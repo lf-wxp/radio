@@ -44,12 +44,24 @@ export component RadioWindow inherits MaterialWindow {
     in-out property <string> stereo-text: "MO";
     // True when the chip is in real stereo (used to colour the badge).
     in-out property <bool> stereo-active: false;
+    // RDS-AF (alternative-frequency) badge. Empty when the broadcaster
+    // has not announced an AF list; otherwise something like `AF·5`
+    // (5 alternatives known) or `AF→` while a probe is active.
+    in-out property <string> af-text: "";
+    // True while the radio task is actively probing AF candidates.
+    // Drives the `af-text` colour so the badge briefly highlights when
+    // the receiver hops to a stronger frequency.
+    in-out property <bool> af-active: false;
     // Whether muted
     in-out property <bool> muted: false;
     // WiFi connection status
     in-out property <bool> wifi-connected: false;
     // WiFi SSID for display
     in-out property <string> wifi-ssid: "";
+    // IPv4 address as `"192.168.1.123"`, empty when WiFi has not yet
+    // received DHCP. When non-empty, the footer prefers showing the
+    // IP over the SSID so the user can read off the web-console URL.
+    in-out property <string> web-ip: "";
     // Status line text
     in-out property <string> status-text: "Tuning...";
     // Preset indicator: e.g. "P 3/5" when slot 3 of 5 saved is active,
@@ -269,6 +281,19 @@ export component RadioWindow inherits MaterialWindow {
                                 : MaterialPalette.outline;
                         }
 
+                        // RDS-AF badge. Hidden when no AF list received;
+                        // brightens to `primary` while the follower is
+                        // actively probing so the user has a beat of
+                        // visual feedback during the brief audio dip.
+                        MaterialText {
+                            text: root.af-text;
+                            visible: root.af-text != "";
+                            style: MaterialTypography.label-small;
+                            color: root.af-active
+                                ? MaterialPalette.primary
+                                : MaterialPalette.outline;
+                        }
+
                         MaterialText {
                             text: root.rssi;
                             style: MaterialTypography.label-small;
@@ -320,7 +345,9 @@ export component RadioWindow inherits MaterialWindow {
                 spacing: 4px;
 
                 MaterialText {
-                    text: root.wifi-connected ? "W: " + root.wifi-ssid : "W: offline";
+                    text: root.wifi-connected
+                        ? (root.web-ip != "" ? "http://" + root.web-ip : "W: " + root.wifi-ssid)
+                        : "W: offline";
                     style: MaterialTypography.label-small;
                     color: root.wifi-connected ? MaterialPalette.primary : MaterialPalette.outline;
                     overflow: elide;

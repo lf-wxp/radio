@@ -2705,6 +2705,7 @@ version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bfb9eb618601c89945a70e254898da93b13be0388091d42117462b265bb3fad"
 dependencies = [
+ "defmt 0.3.100",
  "hash32 0.3.1",
  "serde",
  "stable_deref_trait",
@@ -4458,11 +4459,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3e4976908c758efc04289ad266181f22e252b67daac2710581da9f5aa7a3207a"
 dependencies = [
  "const-sha1",
+ "defmt 1.1.0",
+ "embassy-net",
+ "embassy-time",
  "embedded-io-async 0.7.0",
  "heapless 0.8.0",
  "picoserve_derive",
  "pin-project",
+ "ryu",
  "serde",
+ "serde-json-core",
  "thiserror 2.0.18",
 ]
 
@@ -4807,6 +4813,7 @@ dependencies = [
  "picoserve",
  "portable-atomic",
  "rtt-target",
+ "serde",
  "slint",
  "slint-build",
  "smoltcp",
@@ -5290,6 +5297,18 @@ checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
 dependencies = [
  "serde_core",
  "serde_derive",
+]
+
+[[package]]
+name = "serde-json-core"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b81787e655bd59cecadc91f7b6b8651330b2be6c33246039a65e5cd6f4e0828"
+dependencies = [
+ "defmt 0.3.100",
+ "heapless 0.8.0",
+ "ryu",
+ "serde",
 ]
 
 [[package]]

@@ -792,7 +792,43 @@ pub struct RdsDecoder {
   /// stabilises within the first ~100 ms of tuning. `None` until the
   /// first RDS group is seen for the current station.
   pty: Option<u8>,
+
+  /// Most recently observed Programme Identification (PI) code, taken
+  /// straight from RDS Block A. `None` until the first RDS group is
+  /// processed on the current station. Used by the AF (alternative
+  /// frequency) follower to verify that a candidate frequency carries
+  /// the same programme before we commit to switching.
+  pi: Option<u16>,
+
+  /// Alternative-frequency (AF) list accumulated from group 0A block C.
+  ///
+  /// Stored as 0.1 MHz units (matching `Si4703::tune`'s argument), so
+  /// `965` means 96.5 MHz. The 25-slot ceiling matches the RDS "method A"
+  /// maximum AF list length (count code 224..=249 → up to 25 entries).
+  af_freqs: [u16; AF_LIST_MAX],
+  /// Number of valid entries currently in [`Self::af_freqs`].
+  af_count: u8,
+  /// Expected list length announced by the most recent leading AF code
+  /// (224..=249). Used purely as a debug / diagnostic hint; the decoder
+  /// stops accepting new entries once `af_count` matches this.
+  af_expected: u8,
 }
+
+/// Maximum length of an RDS "method A" AF list (count code 249 = 25 entries).
+const AF_LIST_MAX: usize = 25;
+
+/// Sentinel for "AF list follows, expected length = N" (codes 224..=249).
+const AF_LIST_LEAD_BASE: u8 = 224;
+const AF_LIST_LEAD_MAX: u8 = 249;
+
+/// First valid AF "frequency code" (n = 1 → 87.6 MHz at 0.1 MHz steps).
+const AF_FREQ_MIN: u8 = 1;
+/// Last valid AF "frequency code" (n = 204 → 107.9 MHz).
+const AF_FREQ_MAX: u8 = 204;
+/// Base frequency offset for AF codes, in 0.1 MHz units (`87.5 MHz × 10`).
+///
+/// Spec: AF code `n ∈ 1..=204` represents `(87.5 + n × 0.1) MHz`.
+const AF_FREQ_BASE_X10: u16 = 875;
 
 impl RdsDecoder {
   /// Create a new RDS decoder instance
@@ -807,6 +843,10 @@ impl RdsDecoder {
       rt_complete: false,
       ct_pending: None,
       pty: None,
+      pi: None,
+      af_freqs: [0; AF_LIST_MAX],
+      af_count: 0,
+      af_expected: 0,
     }
   }
 
@@ -814,10 +854,15 @@ impl RdsDecoder {
   ///
   /// Feed the four RDS blocks obtained from [`Si4703::read_rds`] into this method.
   /// Returns `true` if the PS (station) name is now complete.
-  pub fn process(&mut self, _block_a: u16, block_b: u16, block_c: u16, block_d: u16) -> bool {
+  pub fn process(&mut self, block_a: u16, block_b: u16, block_c: u16, block_d: u16) -> bool {
     // Group type is in bits 15-12 of block B; bit 11 is the version (0 = A, 1 = B)
     let group_type = (block_b >> 12) & 0x0F;
     let version_b = (block_b & 0x0800) != 0;
+
+    // Programme Identification sits in *every* Block A. Caching the most
+    // recent value lets the AF follower confirm a candidate frequency
+    // belongs to the same programme before committing to the switch.
+    self.pi = Some(block_a);
 
     // Programme Type sits in bits 10..=6 of *every* Block B regardless of
     // group, so the cheapest place to harvest it is right here.
@@ -830,6 +875,11 @@ impl RdsDecoder {
         self.ps_name[segment * 2] = (block_d >> 8) as u8;
         self.ps_name[segment * 2 + 1] = (block_d & 0xFF) as u8;
         self.ps_valid |= 1 << segment;
+        // Group 0A also carries two AF "frequency codes" in block C
+        // (high byte first). 0B repeats PI in block C and carries no AF.
+        if !version_b {
+          self.process_af_codes((block_c >> 8) as u8, (block_c & 0xFF) as u8);
+        }
       }
       // Group 2A / 2B: RadioText
       2 => self.process_rt(block_b, block_c, block_d, version_b),
@@ -976,6 +1026,10 @@ impl RdsDecoder {
     self.rt_complete = false;
     self.ct_pending = None;
     self.pty = None;
+    self.pi = None;
+    self.af_freqs = [0; AF_LIST_MAX];
+    self.af_count = 0;
+    self.af_expected = 0;
   }
 
   /// Most recently observed Programme Type (PTY) code, 0..=31.
@@ -984,6 +1038,76 @@ impl RdsDecoder {
   /// station. Use [`pty_label`] to map to a human-readable string.
   pub fn pty(&self) -> Option<u8> {
     self.pty
+  }
+
+  /// Most recently observed Programme Identification (PI) code from
+  /// Block A. `None` until the first RDS group is processed on the
+  /// current station.
+  ///
+  /// PI is the primary handle for verifying that an alternative
+  /// frequency carries the same programme: the AF follower compares
+  /// the candidate's PI to the original station's PI and refuses to
+  /// switch on a mismatch.
+  pub fn pi(&self) -> Option<u16> {
+    self.pi
+  }
+
+  /// Alternative-frequency (AF) list collected from group 0A.
+  ///
+  /// Each entry is in 0.1 MHz units (e.g. `965` = 96.5 MHz), matching
+  /// the argument format of [`Si4703::tune`]. The slice is empty until
+  /// at least one valid AF code has been decoded; entries are
+  /// deduplicated and the original station's own frequency is *not*
+  /// filtered out (callers are expected to skip it).
+  pub fn alt_freqs(&self) -> &[u16] {
+    &self.af_freqs[..self.af_count as usize]
+  }
+
+  /// Process the two AF codes carried in group 0A block C.
+  ///
+  /// Encoding (RBDS standard, AF method A):
+  /// - `0`        — filler.
+  /// - `1..=204`  — frequency: `87.5 MHz + n × 0.1 MHz`.
+  /// - `205..=223`— reserved / filler.
+  /// - `224..=249`— "AF list follows", count = code − 224 (0..=25).
+  /// - `250`      — LF/MF list start (we treat as filler; we're FM-only).
+  /// - `251..=255`— reserved.
+  ///
+  /// Method B (paired) is intentionally **not** parsed: it interleaves
+  /// the tuned frequency with each AF and would require additional
+  /// state to disentangle. Method A covers the vast majority of real
+  /// broadcasts; an unparsed B-method list simply leaves `af_count = 0`
+  /// and the AF follower stays dormant on that station.
+  fn process_af_codes(&mut self, code_a: u8, code_b: u8) {
+    self.process_single_af_code(code_a);
+    self.process_single_af_code(code_b);
+  }
+
+  fn process_single_af_code(&mut self, code: u8) {
+    if (AF_LIST_LEAD_BASE..=AF_LIST_LEAD_MAX).contains(&code) {
+      // Leading code: reset the list and remember the announced length.
+      self.af_freqs = [0; AF_LIST_MAX];
+      self.af_count = 0;
+      self.af_expected = code - AF_LIST_LEAD_BASE;
+      return;
+    }
+
+    if !(AF_FREQ_MIN..=AF_FREQ_MAX).contains(&code) {
+      // Filler / reserved / LF-MF marker — ignore.
+      return;
+    }
+
+    let freq_x10 = AF_FREQ_BASE_X10 + u16::from(code);
+
+    // Deduplicate: AF lists are tiny (≤25), so a linear scan is fine
+    // and avoids pulling in a hash set on a no_std target.
+    if self.af_freqs[..self.af_count as usize].contains(&freq_x10) {
+      return;
+    }
+    if (self.af_count as usize) < AF_LIST_MAX {
+      self.af_freqs[self.af_count as usize] = freq_x10;
+      self.af_count += 1;
+    }
   }
 
   /// Internal Clock-Time decode (Group 4A).

@@ -77,6 +77,12 @@ pub const SPECTRUM_LEN: usize = 52;
 pub enum RadioCommand {
   /// Tune by a relative number of 0.1 MHz steps (positive = up).
   TuneRelative(i16),
+  /// Tune to an exact frequency in MHz × 10 (e.g. `1015` = 101.5 MHz).
+  ///
+  /// Used by the LAN web console to jump to an arbitrary station
+  /// without first having to read the current frequency. The radio
+  /// task clamps to the FM band before issuing the I2C tune.
+  TuneAbsolute(u16),
   /// Toggle mute.
   ToggleMute,
   /// Save the current frequency into the next preset slot.
@@ -191,6 +197,13 @@ impl Default for PresetSet {
 ///
 /// The `dirty` flag protects the UI loop from cloning the whole struct
 /// (and the heap-allocated SSID) on every render frame.
+#[allow(
+  clippy::large_stack_frames,
+  reason = "the auto-derived `Clone` of RadioState pulls in three heap String \
+            buffers, an inline 52-byte spectrum, and a PresetSet — all of \
+            which the UI render path intentionally clones on every dirty \
+            tick. ~1.1 KiB stays well under the 16 KiB Embassy task stack."
+)]
 #[derive(Clone, Debug)]
 pub struct RadioState {
   pub freq_mhz_x10: u16,
@@ -215,6 +228,18 @@ pub struct RadioState {
   /// every RDS Block B. `None` when no RDS group has been received yet
   /// or when the broadcaster reports PTY 0 ("no programme type").
   pub pty_label: Option<&'static str>,
+  /// Number of distinct alternative-frequency (AF) entries decoded
+  /// from RDS group 0A on the current station. `0` until the
+  /// broadcaster transmits an AF list (or when the station does not
+  /// participate in AF). The UI surfaces this as a small `AF·N` badge
+  /// so listeners know the receiver may switch frequencies on weak
+  /// signal.
+  pub af_count: u8,
+  /// `true` while an AF probe is actively executing (chip is briefly
+  /// off the original frequency tuning candidate AFs). The UI uses
+  /// this to flash an indicator and suppress transient RSSI/RDS
+  /// updates that don't reflect the listener's chosen station.
+  pub af_following: bool,
   pub wifi_connected: bool,
   pub wifi_ssid: String,
   pub status: &'static str,
@@ -239,6 +264,13 @@ pub struct RadioState {
   /// Slot index of the currently tuned preset, or `None` if the dial
   /// sits on a frequency that hasn't been saved.
   pub preset_idx: Option<u8>,
+  /// IPv4 address of the device's web console, in network-byte order.
+  ///
+  /// `None` until WiFi has joined a STA network and DHCP completes; the
+  /// UI hides the badge in that case. Surfacing the address on the
+  /// LCD lets the listener type it into a phone browser without
+  /// digging through the router admin panel.
+  pub web_ip: Option<[u8; 4]>,
   /// True when fields have been mutated since the UI last read them.
   pub dirty: bool,
 }
@@ -256,12 +288,15 @@ impl RadioState {
       radio_text: String::new(),
       clock_hh_mm: None,
       pty_label: None,
+      af_count: 0,
+      af_following: false,
       wifi_connected: false,
       wifi_ssid: String::new(),
       status: "Booting...",
       spectrum: [0; SPECTRUM_LEN],
       presets: PresetSet::empty(),
       preset_idx: None,
+      web_ip: None,
       dirty: true,
     }
   }
@@ -361,6 +396,32 @@ pub async fn publish_pty(label: Option<&'static str>) {
   let mut state = RADIO_STATE.lock().await;
   if state.pty_label != label {
     state.pty_label = label;
+    state.dirty = true;
+  }
+}
+
+/// Update the shared AF list size and "probe in progress" indicator.
+///
+/// Called at the end of every refresh tick (with the latest list size
+/// and `following = false`) and from inside [`crate::tasks::run_af_probe`]
+/// (with `following = true`) so the UI can briefly highlight the badge.
+pub async fn publish_af_status(af_count: u8, af_following: bool) {
+  let mut state = RADIO_STATE.lock().await;
+  if state.af_count != af_count || state.af_following != af_following {
+    state.af_count = af_count;
+    state.af_following = af_following;
+    state.dirty = true;
+  }
+}
+
+/// Publish the device's IPv4 address (octets in network-byte order) so
+/// the LCD can show the web-console URL.
+///
+/// Pass `None` to clear the badge (e.g. on WiFi disconnect).
+pub async fn publish_web_ip(ip: Option<[u8; 4]>) {
+  let mut state = RADIO_STATE.lock().await;
+  if state.web_ip != ip {
+    state.web_ip = ip;
     state.dirty = true;
   }
 }

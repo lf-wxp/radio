@@ -48,6 +48,7 @@
 
 #![no_std]
 #![no_main]
+#![feature(impl_trait_in_assoc_type)]
 #![deny(
   clippy::mem_forget,
   reason = "mem::forget is generally not safe to do with esp_hal types, especially those \
@@ -62,6 +63,7 @@ mod presets;
 mod state;
 mod tasks;
 mod ui;
+mod web;
 
 use defmt::info;
 use embassy_executor::Spawner;
@@ -184,11 +186,41 @@ async fn main(spawner: Spawner) -> ! {
       state.status = "WiFi OK";
       state.dirty = true;
       drop(state);
+      // Spawn the LAN web console. picoserve's `Router` and `Config`
+      // both need a `'static` lifetime, so we lift them through
+      // `make_static!` here — they're tiny (PathRouter is a couple
+      // of pointers, Config is just timeouts) so static placement
+      // costs nothing. The web task itself waits for DHCP and
+      // publishes the IP back into [`RADIO_STATE`] so the LCD can
+      // show a `http://x.x.x.x` badge.
+      let app: &'static picoserve::AppRouter<web::AppProps> = picoserve::make_static!(
+        picoserve::AppRouter<web::AppProps>,
+        <web::AppProps as picoserve::AppBuilder>::build_app(web::AppProps)
+      );
+      let config: &'static picoserve::Config = picoserve::make_static!(
+        picoserve::Config,
+        picoserve::Config::new(picoserve::Timeouts {
+          start_read_request: embassy_time::Duration::from_secs(5),
+          persistent_start_read_request: embassy_time::Duration::from_secs(5),
+          read_request: embassy_time::Duration::from_secs(5),
+          write: embassy_time::Duration::from_secs(5),
+        })
+      );
+      let stack = connected.stack;
       // We intentionally drop `connected` here: the embassy-net stack and
       // controller continue running through the spawned task. Future
       // features (NTP, internet radio) can take ownership of the stack
       // before that.
       drop(connected);
+      match web::web_task(stack, app, config) {
+        Ok(token) => {
+          spawner.spawn(token);
+          info!("Web console listening on :80");
+        }
+        Err(_e) => {
+          defmt::error!("Failed to spawn web task: task arena full");
+        }
+      }
     }
     Err(e) => {
       info!("WiFi failed: {} - continuing offline", e);

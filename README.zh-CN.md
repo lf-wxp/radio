@@ -40,6 +40,8 @@
   - [📦 性能与体积](#-性能与体积)
   - [🔄 开发工作流](#-开发工作流)
   - [🧰 技术栈](#-技术栈)
+  - [🌐 Web 控制台](#-web-控制台)
+    - [REST API](#rest-api)
   - [🐛 常见问题与 FAQ](#-常见问题与-faq)
   - [🗺️ 路线图](#️-路线图)
     - [✅ 已完成](#-已完成)
@@ -360,6 +362,37 @@ flowchart LR
 
 ---
 
+## 🌐 Web 控制台
+
+WiFi 联上后，LCD 底部会显示 `http://<ip>`（就是路由器 DHCP
+租约列表里那个地址）。同一个局域网里任何手机浏览器访问这个地
+址，就能看到一个手机友好的遥控器：频率大字、±0.1 MHz 按钮、直接
+输入跳转、收藏台快捷、实时 RDS PS / RT / AF / 时钟徽标。页面每秒
+拉取一次设备状态。
+
+> 🔓 **零鉴权。** 必须在你信任的局域网使用，别把设备直接暴
+> 露到公网 —— picoserve 自己的 README 也明确不推荐裸露公网。
+
+### REST API
+
+所有接口都在 80 端口，请求体为 JSON 或空。
+
+| 方法   | 路径                  | 请求体                       | 作用                                                                       |
+|--------|-----------------------|----------------------------|----------------------------------------------------------------------------|
+| GET    | `/`                   | —                          | 单页 HTML 控制台。                                                          |
+| GET    | `/api/state`          | —                          | JSON 状态快照：频率、RSSI、PS/RT/PTY/AF、静音、收藏台、WiFi。              |
+| POST   | `/api/tune`           | `{"freq_x10":1015}`         | 调到 101.5 MHz；超出、87.5–108.0」返回 `400`。                              |
+| POST   | `/api/tune/up`        | —                          | +0.1 MHz。                                                                  |
+| POST   | `/api/tune/down`      | —                          | −0.1 MHz。                                                                  |
+| POST   | `/api/preset/cycle`   | —                          | 跳到下一个收藏台（循环）。                                                  |
+| POST   | `/api/preset/save`    | —                          | 保存当前频率（33 个槽全满后 FIFO 淘汰）。                                  |
+| POST   | `/api/mute`           | —                          | 切换静音。                                                                  |
+
+所有命令走与旋钮完全相同的通道 —— web tune 与旋钮调台在控制任务内部自
+然串行，未新增任何额外锁。
+
+---
+
 ## 🐛 常见问题与 FAQ
 
 <details>
@@ -371,7 +404,7 @@ flowchart LR
 <details>
 <summary><b>WiFi 一直连不上</b></summary>
 
-启动时长按编码器可清除已存凭据，下次开机会重新进入 SoftAP 配网门户。也可以用 <code>probe-rs erase --chip esp32c6</code> 直接擦除 Flash。
+**在开机启动画面期间**（收音机任务尚未启动时）长按编码器可清除已存凭据，下次开机会重新进入 SoftAP 配网门户。这个启动期手势和运行时的长按是两条独立路径——运行时长按只会保存当前频点为收藏台，不会动 WiFi 凭据。也可以用 <code>probe-rs erase --chip esp32c6</code> 直接擦除 Flash。
 </details>
 
 <details>
@@ -384,6 +417,16 @@ flowchart LR
 <summary><b>屏幕一直黑屏</b></summary>
 
 确认 GPIO23 背光接好，并按 <code>SCK / MOSI / CS / DC / RST</code> 顺序核对 SPI 接线。最常见的坑是 <code>RST</code> 引脚悬空。
+</details>
+
+<details>
+<summary><b>为什么在信号边缘的台上会短暂掉音？</b></summary>
+
+这是 RDS-AF 跟随在探测备用频率。当信号连续 5 秒低于 RSSI
+18 且广播台已告知 AF 列表（会在立体声指示器旁边看到
+<code>AF·N</code> 徽标）时，收音机会依次 ping 每个备选频点比较
+RSSI：PI 校验一致且信号明显提升则跳到最强频点，否则回滚到原
+频率。探测后冷却 30 秒；未广播 AF 列表的台不会触发。
 </details>
 
 <details>
@@ -411,8 +454,9 @@ flowchart LR
 - [x] WiFi 强制门户配网 + Flash 持久化
 - [x] ST7789 上的 Slint Material UI
 - [x] 设备端测试（`embedded-test`）
-- [x] RDS 时间码（CT）—— 从 group 4A 自动同步墙钟
-
+- [x] RDS 时间码（CT）——从 group 4A 自动同步墙钟
+- [x] RDS-AF 备用频率自动跟随——低信号探测 + PI 校验不一致回滚
+- [x] 局域网 Web 控制台——手机友好单页 + JSON API（监听 80 端口）
 ### 🚧 规划中（不增加任何硬件）
 
 下表中所有功能都基于现有外设落地：Si4703、ST7789、KY-040、Wi-Fi、
@@ -425,8 +469,8 @@ BLE 射频、Flash。工时为单人投入估算。
 | ✅  | RSSI 频谱图（“看图调台”）                            | 1 天    | 启动时一次 `sweep_rssi` 扫 87.5–108.0 MHz，52 格柱状图 + 当前频点高亮。已于 2026-06 交付。 |
 | ✅  | 旋钮调台加速                                          | 0.25 天 | 按 detent 间隔动态选档（×1/×2/×3/×5），反转或 idle 超时自动重置。已于 2026-06 交付。 |
 | ✅  | 收藏台 Presets + 上电恢复上次频率                    | 1.5 天  | 写入 `storage` 分区（0x3E_0000）；短按循环收藏、长按保存、超长按静音。已于 2026-06 交付。 |
-| 6   | RDS-AF 备用频率自动跟踪                              | 2 天    | Group 0A block C 已经传到解码器，目前直接丢弃。                                       |
-| 7   | 局域网 Web 控制台（`/api/state`、`/api/tune`）       | 2 天    | 基于 picoserve，单页 HTML + JSON API，手机当遥控器。                                  |
+| ✅  | RDS-AF 备用频率自动跟随                              | 2 天    | Group 0A block C 解析、PI 校验；RSSI 连续 5 s ≤ 18 且存在 AF 列表时探测并跳到最强频点，PI 不匹配则回滚。已于 2026-06 交付。 |
+| ✅  | 局域网 Web 控制台（`/api/state`、`/api/tune`）       | 2 天    | 手机友好单页 HTML + JSON API，监听 80 端口；DHCP 完成后 LCD 底部显示访问 URL。已于 2026-06 交付。 |
 | 8   | mDNS 广播 `esp-radio.local`                          | 1 天    | 复用现有 UDP socket 写最小响应器，配合 #7。                                            |
 | 9   | RDS 收听日志（PS/RT/RSSI 环形缓冲）                  | 1 天    | 纯文本回放，无需音频通路。                                                            |
 | 10  | BLE HID 遥控（自拍器/翻页器风格）                    | 2–3 天  | `esp-radio` `ble` + `trouble-host` 依赖已就位；注意 Wi-Fi/BLE coex 风险。             |

@@ -40,6 +40,8 @@
   - [📦 Performance \& footprint](#-performance--footprint)
   - [🔄 Development workflow](#-development-workflow)
   - [🧰 Tech stack](#-tech-stack)
+  - [🌐 Web console](#-web-console)
+    - [REST API](#rest-api)
   - [🐛 Troubleshooting \& FAQ](#-troubleshooting--faq)
   - [🗺️ Roadmap](#️-roadmap)
     - [✅ Shipped](#-shipped)
@@ -360,6 +362,38 @@ flowchart LR
 
 ---
 
+## 🌐 Web console
+
+Once WiFi is up, the LCD footer shows `http://<ip>` (the same address
+that appeared in your router's DHCP lease list). Open it from any
+phone on the same network for a phone-friendly remote with frequency
+display, +/-0.1 MHz buttons, direct tune-to input, preset chips, and
+live RDS PS/RT/AF/clock badges. Polls the device once per second.
+
+> 🔓 **No authentication.** Treat the device as you would a
+> chromecast or a printer: trusted home networks only. picoserve's
+> own README warns against direct internet exposure as well.
+### REST API
+
+All endpoints live on port 80; bodies are JSON or empty.
+
+| Method | Path                  | Body                       | Effect                                                                       |
+|--------|-----------------------|----------------------------|------------------------------------------------------------------------------|
+| GET    | `/`                   | —                          | Single-page HTML console.                                                    |
+| GET    | `/api/state`          | —                          | JSON snapshot: freq, RSSI, PS/RT/PTY/AF, mute, presets, WiFi.                |
+| POST   | `/api/tune`           | `{"freq_x10":1015}`         | Tune to 101.5 MHz; `400` outside `87.5–108.0`.                               |
+| POST   | `/api/tune/up`        | —                          | Nudge +0.1 MHz.                                                              |
+| POST   | `/api/tune/down`      | —                          | Nudge −0.1 MHz.                                                              |
+| POST   | `/api/preset/cycle`   | —                          | Jump to next saved preset (wraps).                                           |
+| POST   | `/api/preset/save`    | —                          | Persist current frequency (FIFO eviction past 8 slots).                      |
+| POST   | `/api/mute`           | —                          | Toggle mute.                                                                 |
+
+Commands flow through the same channel as the rotary encoder, so a
+web tune and a knob turn always serialise correctly inside the radio
+task — no extra mutexes were added.
+
+---
+
 ## 🐛 Troubleshooting & FAQ
 
 <details>
@@ -371,7 +405,7 @@ Make sure your USB-JTAG bridge is connected and the device is in download mode; 
 <details>
 <summary><b>WiFi never connects</b></summary>
 
-Long-press the encoder during boot to clear stored credentials — the SoftAP portal will appear again on next boot. You can also wipe flash with <code>probe-rs erase --chip esp32c6</code>.
+Long-press the encoder **during the boot splash** (before the radio task starts) to clear stored credentials — the SoftAP portal will appear again on next boot. This boot-time gesture is a separate flow from the in-app long-press, which saves a preset rather than touching WiFi. You can also wipe flash with <code>probe-rs erase --chip esp32c6</code>.
 </details>
 
 <details>
@@ -384,6 +418,18 @@ Use <code>cargo make ui-preview*</code> (it injects <code>SDKROOT</code> and <co
 <summary><b>Display stays black</b></summary>
 
 Check the <code>BLK</code> (backlight) pin on GPIO23 and the SPI wiring order (<code>SCK</code>, <code>MOSI</code>, <code>CS</code>, <code>DC</code>, <code>RST</code>). A floating <code>RST</code> line is the most common offender.
+</details>
+
+<details>
+<summary><b>Why does the audio briefly cut out on a marginal station?</b></summary>
+
+That's the RDS-AF follower probing alternative frequencies. When the
+signal stays ≤ 18 RSSI for 5 seconds *and* the broadcaster has
+announced an AF list (the small <code>AF·N</code> badge appears next to
+the stereo indicator), the radio briefly tunes each candidate to
+compare RSSI, then either commits to the strongest one (PI-verified)
+or rolls back to the original frequency. The follower then cools down
+for 30 s. Stations without an AF list never trigger this behaviour.
 </details>
 
 <details>
@@ -413,6 +459,8 @@ recommended implementation sequence within each lane.
 - [x] Slint Material UI on ST7789
 - [x] On-device tests (`embedded-test`)
 - [x] RDS Clock-Time (CT) — auto-sync wall clock from group 4A
+- [x] RDS-AF alternative-frequency follow — PI-gated weak-signal probe
+- [x] LAN web console — phone-friendly single-page UI + JSON API on port 80
 
 ### 🚧 Planned (no extra hardware required)
 
@@ -427,7 +475,7 @@ working days.
 | ✅  | RSSI band scope ("see-the-band" tuning UI)                  | 1 d    | Boot-time `sweep_rssi` over 87.5–108.0 MHz; 52-bucket bar chart with cursor highlight. Shipped 2026-06. |
 | ✅  | Tune acceleration on the rotary encoder                     | 0.25 d | Detent-rate-driven step multiplier (×1/×2/×3/×5) with direction-reversal & idle resets. Shipped 2026-06. |
 | ✅  | Presets + restore last frequency on boot                    | 1.5 d  | `esp-storage` record at partition `storage` (0x3E_0000); short-press cycles saved stations, long-press saves, ultra-long mutes. Shipped 2026-06. |
-| 6   | RDS-AF alternative-frequency follow                         | 2 d    | Group 0A block C is already piped in but discarded.                                  |
+| ✅  | RDS-AF alternative-frequency follow                         | 2 d    | Group 0A block C parsed, PI gated; weak-signal probe ( ≤ 18 RSSI for 5 s) auto-hops to the strongest AF and rolls back if PI mismatches. Shipped 2026-06. |
 | 7   | LAN web console via `picoserve` (`/api/state`, `/api/tune`) | 2 d    | Tiny single-page HTML + JSON API; phone becomes a remote.                            |
 | 8   | mDNS broadcast `esp-radio.local`                            | 1 d    | Minimal responder over the existing `socket-udp`; pairs with #7.                     |
 | 9   | RDS listening log (rolling flash buffer of PS/RT/RSSI)      | 1 d    | Pure-text replay; no audio path needed.                                              |

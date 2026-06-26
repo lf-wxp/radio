@@ -11,6 +11,12 @@ use crate::RadioWindow;
 use crate::state::{RADIO_STATE, RadioState, SPECTRUM_LEN};
 
 /// Mirror a [`RadioState`] snapshot into the Slint component.
+#[allow(
+  clippy::large_stack_frames,
+  reason = "holds the full RadioState snapshot (heap Strings + 52-byte \
+            spectrum + PresetSet) plus a few transient format String \
+            allocations; ~1 KiB is well under the 16 KiB Embassy task stack."
+)]
 fn apply_state_to_ui(ui: &RadioWindow, snapshot: &RadioState) {
   ui.set_freq_mhz_x10(snapshot.freq_mhz_x10 as i32);
   ui.set_rssi(snapshot.rssi as i32);
@@ -18,6 +24,13 @@ fn apply_state_to_ui(ui: &RadioWindow, snapshot: &RadioState) {
   ui.set_muted(snapshot.muted);
   ui.set_wifi_connected(snapshot.wifi_connected);
   ui.set_wifi_ssid(snapshot.wifi_ssid.as_str().into());
+  // Web console IP — dotted-quad ASCII when known, empty string
+  // otherwise (the Slint side hides the IP form when empty).
+  let web_ip = match snapshot.web_ip {
+    Some([a, b, c, d]) => alloc::format!("{}.{}.{}.{}", a, b, c, d),
+    None => alloc::string::String::new(),
+  };
+  ui.set_web_ip(web_ip.as_str().into());
   ui.set_status_text(snapshot.status.into());
   ui.set_station_name(snapshot.station_name.as_str().into());
   ui.set_radio_text(snapshot.radio_text.as_str().into());
@@ -46,6 +59,19 @@ fn apply_state_to_ui(ui: &RadioWindow, snapshot: &RadioState) {
   };
   ui.set_stereo_text(stereo_text.into());
   ui.set_stereo_active(snapshot.stereo && !snapshot.auto_mono);
+
+  // RDS-AF badge: empty when the broadcaster has not announced any
+  // alternative frequencies, `AF→` while a probe is in flight (so the
+  // listener sees why audio briefly dipped), and `AF·N` otherwise.
+  let af_text = if snapshot.af_following {
+    alloc::string::String::from("AF→")
+  } else if snapshot.af_count == 0 {
+    alloc::string::String::new()
+  } else {
+    alloc::format!("AF·{}", snapshot.af_count)
+  };
+  ui.set_af_text(af_text.as_str().into());
+  ui.set_af_active(snapshot.af_following);
 
   // Preset indicator: empty when nothing saved (component hides itself
   // via `visible: preset-text != ""`); otherwise `P {idx}/{used}` when

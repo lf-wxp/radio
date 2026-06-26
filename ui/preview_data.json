@@ -9,7 +9,10 @@
   "pty-label": "Pop M",
   "stereo-text": "ST",
   "stereo-active": true,
+  "af-text": "AF·5",
+  "af-active": false,
   "wifi-connected": true,
   "wifi-ssid": "MyHomeWiFi",
+  "web-ip": "192.168.1.123",
   "status-text": "Tuned"
 }

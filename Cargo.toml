@@ -73,9 +73,15 @@ smoltcp = {version = "0.13.1", default-features = false, features = [
 trouble-host = {version = "0.6.0", features = ["gatt"]}
 
 critical-section = "1.2.0"
-picoserve = "0.18.0"
+picoserve = {version = "0.18.0", default-features = false, features = [
+  "embassy",
+  "json",
+  "defmt",
+  "alloc",
+]}
 portable-atomic = {version = "1", default-features = false}
 static_cell = "2.1.1"
+serde = {version = "1", default-features = false, features = ["derive", "alloc"]}
 
 # Slint UI framework（embedded no_std）
 slint = {version = "1.16", default-features = false, features = [
