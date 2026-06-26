@@ -365,8 +365,11 @@ flowchart LR
 ## 🌐 Web console
 
 Once WiFi is up, the LCD footer shows `http://<ip>` (the same address
-that appeared in your router's DHCP lease list). Open it from any
-phone on the same network for a phone-friendly remote with frequency
+that appeared in your router's DHCP lease list). On any device with
+mDNS support (macOS, iOS, Linux + Avahi, Windows 10+ with "Network
+Discovery" enabled, recent Android Chrome) you can also just open
+**<http://esp-radio.local/>** — same console, no IP lookup needed.
+Either URL gives you a phone-friendly remote with frequency
 display, +/-0.1 MHz buttons, direct tune-to input, preset chips, and
 live RDS PS/RT/AF/clock badges. Polls the device once per second.
 
@@ -461,6 +464,8 @@ recommended implementation sequence within each lane.
 - [x] RDS Clock-Time (CT) — auto-sync wall clock from group 4A
 - [x] RDS-AF alternative-frequency follow — PI-gated weak-signal probe
 - [x] LAN web console — phone-friendly single-page UI + JSON API on port 80
+- [x] mDNS responder — reach the console at `http://esp-radio.local/`
+- [x] mDNS responder — reach the console at `http://esp-radio.local/`
 
 ### 🚧 Planned (no extra hardware required)
 
@@ -477,7 +482,7 @@ working days.
 | ✅  | Presets + restore last frequency on boot                    | 1.5 d  | `esp-storage` record at partition `storage` (0x3E_0000); short-press cycles saved stations, long-press saves, ultra-long mutes. Shipped 2026-06. |
 | ✅  | RDS-AF alternative-frequency follow                         | 2 d    | Group 0A block C parsed, PI gated; weak-signal probe ( ≤ 18 RSSI for 5 s) auto-hops to the strongest AF and rolls back if PI mismatches. Shipped 2026-06. |
 | 7   | LAN web console via `picoserve` (`/api/state`, `/api/tune`) | 2 d    | Tiny single-page HTML + JSON API; phone becomes a remote.                            |
-| 8   | mDNS broadcast `esp-radio.local`                            | 1 d    | Minimal responder over the existing `socket-udp`; pairs with #7.                     |
+| ✅  | mDNS broadcast `esp-radio.local`                            | 1 d    | Passive A-record responder on `224.0.0.251:5353`; pairs with #7 so the user can browse `http://esp-radio.local/`. Shipped 2026-06. |
 | 9   | RDS listening log (rolling flash buffer of PS/RT/RSSI)      | 1 d    | Pure-text replay; no audio path needed.                                              |
 | 10  | BLE HID remote (selfie-shutter style)                       | 2–3 d  | `esp-radio` `ble` + `trouble-host` already in `Cargo.toml`; mind Wi-Fi/BLE coex.     |
 | 11  | OTA firmware update                                         | 5 d    | **Design complete**, implementation deferred → [docs/ota-design.md](./docs/ota-design.md). |

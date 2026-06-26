@@ -59,6 +59,7 @@
 extern crate alloc;
 
 mod hardware;
+mod mdns;
 mod presets;
 mod state;
 mod tasks;
@@ -92,7 +93,12 @@ slint::include_modules!();
 esp_bootloader_esp_idf::esp_app_desc!();
 
 /// Static storage for the embassy-net stack resources.
-static STACK_RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
+///
+/// Capacity 4: SoftAP captive portal (during provisioning) drops to
+/// 0 once we move to STA. In STA mode we use 1 socket for the web
+/// console (TCP) and 1 socket for the mDNS responder (UDP), leaving
+/// 2 free for future features (NTP, OTA).
+static STACK_RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
 
 /// PCNT interrupt handler for rotary-encoder overflow accumulation.
 ///
@@ -219,6 +225,17 @@ async fn main(spawner: Spawner) -> ! {
         }
         Err(_e) => {
           defmt::error!("Failed to spawn web task: task arena full");
+        }
+      }
+      // mDNS responder so the user can reach the console at
+      // `http://esp-radio.local/` instead of the dynamic DHCP IP.
+      match mdns::mdns_task(stack) {
+        Ok(token) => {
+          spawner.spawn(token);
+          info!("mDNS responder online: esp-radio.local");
+        }
+        Err(_e) => {
+          defmt::error!("Failed to spawn mDNS task: task arena full");
         }
       }
     }

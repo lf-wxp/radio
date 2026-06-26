@@ -562,13 +562,13 @@ impl<'d> WifiProvisioner<'d> {
   /// # Returns
   /// `Ok(ConnectedWifi)` with the ready-to-use network stack, or
   /// `Err(ConnectionError)` if connection fails.
-  pub async fn provision_and_connect(
+  pub async fn provision_and_connect<const N: usize>(
     &mut self,
     spawner: &Spawner,
     wifi: esp_hal::peripherals::WIFI<'static>,
     conn_config: &ConnectionConfig,
     prov_config: &ProvisioningConfig,
-    stack_resources: &'static mut StackResources<3>,
+    stack_resources: &'static mut StackResources<N>,
   ) -> Result<ConnectedWifi, ConnectionError> {
     // Step 1: Get credentials (from Flash or via provisioning)
     let credentials = if let Some(creds) = self.load_credentials() {
@@ -632,12 +632,12 @@ impl<'d> WifiProvisioner<'d> {
 ///
 /// # Returns
 /// `Ok(ConnectedWifi)` on success, `Err(ConnectionError)` on failure.
-pub async fn connect_station(
+pub async fn connect_station<const N: usize>(
   spawner: &Spawner,
   wifi: esp_hal::peripherals::WIFI<'static>,
   credentials: &WifiCredentials,
   config: &ConnectionConfig,
-  stack_resources: &'static mut StackResources<3>,
+  stack_resources: &'static mut StackResources<N>,
 ) -> Result<ConnectedWifi, ConnectionError> {
   defmt::info!("Initializing WiFi in Station mode...");
 
@@ -703,11 +703,11 @@ pub async fn connect_station(
 ///
 /// # Returns
 /// The WiFi credentials submitted by the user.
-pub async fn run_provisioning_server(
+pub async fn run_provisioning_server<const N: usize>(
   spawner: &Spawner,
   wifi: esp_hal::peripherals::WIFI<'static>,
   config: &ProvisioningConfig,
-  stack_resources: &'static mut StackResources<3>,
+  stack_resources: &'static mut StackResources<N>,
 ) -> WifiCredentials {
   defmt::info!("Starting provisioning AP: \"{}\"", config.ap_ssid);
 
