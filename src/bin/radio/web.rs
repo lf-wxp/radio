@@ -76,6 +76,18 @@ struct StateDto {
   auto_mono: bool,
   station_name: alloc::string::String,
   radio_text: alloc::string::String,
+  /// RT+ "now playing" line: pre-formatted as `"{artist} — {title}"`
+  /// (or just title / just artist if only one tag was decoded). `None`
+  /// when the station does not transmit RT+ or while no item is
+  /// currently in progress; the front-end falls back to `radio_text`.
+  /// Skipped from the JSON when null to keep the payload tight at idle.
+  ///
+  /// We pre-join here (rather than emitting two separate fields) to
+  /// shave ≈24 bytes off the [`StateDto`] stack frame; the only
+  /// information the browser loses is whether the broadcaster gave us
+  /// just one of the two tags, which it never disambiguates anyway.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  rt_plus: Option<alloc::string::String>,
   pty_label: Option<&'static str>,
   /// Decoded RDS clock as `"HH:MM"`, empty when no CT received yet.
   clock: alloc::string::String,
@@ -249,11 +261,36 @@ impl AppBuilder for AppProps {
 // Handlers
 // ============================================================================
 
-/// `GET /api/state` \u2014 return a JSON snapshot of [`RADIO_STATE`].
+/// Pre-format an RT+ tag pair into the wire string the browser displays.
+///
+/// Returns:
+/// - `Some("{artist} \u{2014} {title}")` when both tags are present (the common
+///   case for music stations).
+/// - `Some("{artist}")` / `Some("{title}")` when the broadcaster only sent
+///   one of the two (rare, but the spec allows it).
+/// - `None` when neither tag is set, so the JSON omits the field entirely
+///   and the front-end falls back to the raw `radio_text` scroller.
+fn format_rt_plus(artist: Option<&str>, title: Option<&str>) -> Option<alloc::string::String> {
+  match (artist, title) {
+    (Some(a), Some(t)) => Some(alloc::format!("{a} \u{2014} {t}")),
+    (Some(a), None) => Some(alloc::string::String::from(a)),
+    (None, Some(t)) => Some(alloc::string::String::from(t)),
+    (None, None) => None,
+  }
+}
+
+/// `GET /api/state` — return a JSON snapshot of [`RADIO_STATE`].
 ///
 /// Allocates two transient `String`s (PS / RT decoded text) per call;
 /// at the polling cadence the browser uses (1 Hz) this is well under
 /// what `esp-alloc` can sustain.
+#[allow(
+  clippy::large_stack_frames,
+  reason = "the StateDto + JSON wrapper holds four owned String buffers (PS, RT, \
+            RT+ pre-joined, WiFi SSID) plus an inline `[u16; MAX_PRESETS]`; \
+            ~1.1 KiB stays well under the 16 KiB Embassy task stack and is \
+            released as soon as picoserve has serialised the response."
+)]
 async fn handle_get_state() -> picoserve::response::Json<StateDto> {
   let state = RADIO_STATE.lock().await;
   let dto = StateDto {
@@ -265,6 +302,10 @@ async fn handle_get_state() -> picoserve::response::Json<StateDto> {
     auto_mono: state.auto_mono,
     station_name: state.station_name.clone(),
     radio_text: state.radio_text.clone(),
+    rt_plus: format_rt_plus(
+      state.rt_plus_artist.as_deref(),
+      state.rt_plus_title.as_deref(),
+    ),
     pty_label: state.pty_label,
     clock: match state.clock_hh_mm {
       Some((h, m)) => alloc::format!("{:02}:{:02}", h, m),

@@ -307,7 +307,8 @@ Some transitive build dependencies (e.g. `bonjour-sys`) call `bindgen` directly 
 | UTF-8 (RDS extension)           | ✅     | Auto-detected by leading sequence. |
 | Traffic Announcement (TA)       | 🟡     | Decoded but not yet surfaced in UI. |
 | Clock-Time (CT)                 | ✅     | Decoded from group 4A and shown in the top bar (`HH:MM`, local-time offset applied). |
-| RDS-AF alternative-frequency    | ⏳     | Planned. |
+| RDS-AF alternative-frequency    | ✅     | Group 0A block C parsed; weak-signal probe (≤18 RSSI for 5 s) hops to the strongest AF and rolls back on PI mismatch. |
+| RadioText Plus (RT+, AID 0x4BD7)| ✅     | Group 3A registers the ODA, group 11A carries the tags; "now playing" chip shows `{artist} — {title}` when the station broadcasts it. |
 
 ✅ shipping · 🟡 partial · ⏳ planned
 

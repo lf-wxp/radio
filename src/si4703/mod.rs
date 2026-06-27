@@ -812,6 +812,33 @@ pub struct RdsDecoder {
   /// (224..=249). Used purely as a debug / diagnostic hint; the decoder
   /// stops accepting new entries once `af_count` matches this.
   af_expected: u8,
+
+  /// 5-bit "application group type code" announced by group 3A as the
+  /// carrier for the RT+ ODA (`AID = 0x4BD7`).
+  ///
+  /// Layout: `(group_type << 1) | version_b`, so e.g. `0b10110` (=22)
+  /// means "group 11A" — the most common RT+ carrier in practice.
+  /// `None` until a 3A frame announcing AID `0x4BD7` is observed.
+  rt_plus_aid_group: Option<u8>,
+  /// (start, len) of the RT+ "item title" tag inside [`Self::rt_buf`].
+  ///
+  /// `start` is the 6-bit start byte index, `len` is the bytes-minus-one
+  /// length code from the wire — i.e. the actual byte count is `len + 1`,
+  /// in the range `1..=64` (title) / `1..=32` (artist). `None` until the
+  /// first valid RT+ payload group is decoded.
+  rt_plus_title_range: Option<(u8, u8)>,
+  /// (start, len) of the RT+ "item artist" tag inside [`Self::rt_buf`].
+  /// Same encoding as [`Self::rt_plus_title_range`].
+  rt_plus_artist_range: Option<(u8, u8)>,
+  /// RT+ "item running" bit. `false` means the broadcaster has explicitly
+  /// signalled that the title/artist no longer applies (e.g. between
+  /// songs); UI code should hide the cached values in that state.
+  rt_plus_item_running: bool,
+  /// Most recently observed RT+ "item toggle" bit. The broadcaster flips
+  /// this whenever a new title/artist pair starts; we wipe the cached
+  /// ranges on flip so a stale title from the previous song never blends
+  /// with the next one.
+  rt_plus_toggle: Option<bool>,
 }
 
 /// Maximum length of an RDS "method A" AF list (count code 249 = 25 entries).
@@ -830,6 +857,17 @@ const AF_FREQ_MAX: u8 = 204;
 /// Spec: AF code `n ∈ 1..=204` represents `(87.5 + n × 0.1) MHz`.
 const AF_FREQ_BASE_X10: u16 = 875;
 
+/// Application Identifier (AID) for RadioText Plus, registered with the
+/// RDS Forum as `0x4BD7`. Group 3A frames carrying this value in block D
+/// announce which group type carries the actual RT+ payload.
+const RT_PLUS_AID: u16 = 0x4BD7;
+
+/// RT+ content type code 1 = `ITEM.TITLE` (track title).
+const RT_PLUS_CT_ITEM_TITLE: u8 = 1;
+
+/// RT+ content type code 4 = `ITEM.ARTIST` (performing artist).
+const RT_PLUS_CT_ITEM_ARTIST: u8 = 4;
+
 impl RdsDecoder {
   /// Create a new RDS decoder instance
   pub fn new() -> Self {
@@ -847,6 +885,11 @@ impl RdsDecoder {
       af_freqs: [0; AF_LIST_MAX],
       af_count: 0,
       af_expected: 0,
+      rt_plus_aid_group: None,
+      rt_plus_title_range: None,
+      rt_plus_artist_range: None,
+      rt_plus_item_running: false,
+      rt_plus_toggle: None,
     }
   }
 
@@ -883,9 +926,25 @@ impl RdsDecoder {
       }
       // Group 2A / 2B: RadioText
       2 => self.process_rt(block_b, block_c, block_d, version_b),
+      // Group 3A: Open Data Application (ODA) AID announcement. Used to
+      // discover which group type carries RT+ on this station. Group 3B
+      // is allocated to a different ODA mechanism ("Type 3 group") and
+      // does not carry AID announcements, so we only handle 3A.
+      3 if !version_b => self.process_oda_aid(block_b, block_d),
       // Group 4A: Clock-Time (Group 4B is reserved by the spec).
       4 if !version_b => self.process_ct(block_b, block_c, block_d),
-      _ => {}
+      _ => {
+        // RT+ payload group: dispatched dynamically because the spec
+        // lets the broadcaster pick *any* unused group type to carry
+        // RT+ (typically 11A; the AID announcement in group 3A tells
+        // us which one).
+        if let Some(aid_group) = self.rt_plus_aid_group {
+          let observed_app_group = ((group_type as u8) << 1) | u8::from(version_b);
+          if observed_app_group == aid_group {
+            self.process_rt_plus(block_b, block_c, block_d);
+          }
+        }
+      }
     }
 
     // All 4 PS segments received
@@ -1030,6 +1089,11 @@ impl RdsDecoder {
     self.af_freqs = [0; AF_LIST_MAX];
     self.af_count = 0;
     self.af_expected = 0;
+    self.rt_plus_aid_group = None;
+    self.rt_plus_title_range = None;
+    self.rt_plus_artist_range = None;
+    self.rt_plus_item_running = false;
+    self.rt_plus_toggle = None;
   }
 
   /// Most recently observed Programme Type (PTY) code, 0..=31.
@@ -1151,6 +1215,171 @@ impl RdsDecoder {
   /// approximately once per minute, on the minute boundary) exactly once.
   pub fn take_clock_time(&mut self) -> Option<RdsClockTime> {
     self.ct_pending.take()
+  }
+
+  // --------------------------------------------------------------------
+  // RT+ (RadioText Plus) — ODA AID 0x4BD7
+  // --------------------------------------------------------------------
+  //
+  // RT+ is layered on top of the regular RT message: the broadcaster
+  // first transmits the song info as plain RadioText (e.g. `"Now playing:
+  // Daft Punk — Get Lucky"`), and *additionally* publishes a small
+  // structured packet that points into the RT buffer with `(content_type,
+  // start, length)` triples. The receiver can then surface artist/title
+  // separately without resorting to fragile string parsing.
+  //
+  // We deliberately track only the two most useful tags (title/artist)
+  // and drop everything else (album, genre, station URL, …): they're
+  // transmitted infrequently in practice and would just bloat the
+  // decoder for fields the UI has no slot for.
+
+  /// Internal: process a group 3A "ODA application identifier" frame.
+  ///
+  /// Wire format (RBDS / IEC 62106 § 6.1.5.4):
+  /// - Block B bits 4..0 = 5-bit "application group type code"
+  ///   (`group_type << 1 | version_b`).
+  /// - Block D = 16-bit AID owned by that group type.
+  ///
+  /// We only care about `AID = 0x4BD7` (RT+); other ODAs (TMC, eRT, …)
+  /// are ignored for size reasons.
+  fn process_oda_aid(&mut self, block_b: u16, block_d: u16) {
+    if block_d != RT_PLUS_AID {
+      return;
+    }
+    let app_group = (block_b & 0x001F) as u8;
+    self.rt_plus_aid_group = Some(app_group);
+  }
+
+  /// Internal: process a single RT+ payload group (group type announced
+  /// via [`Self::process_oda_aid`], typically 11A).
+  ///
+  /// Wire format (RDS Forum R08/008):
+  /// ```text
+  ///   block B[4]    = item toggle
+  ///   block B[3]    = item running
+  ///   block B[2:0]  = content_type_1 [5:3]
+  ///   block C[15:13]= content_type_1 [2:0]
+  ///   block C[12:7] = start_1 (6 bits)
+  ///   block C[6:1]  = length_1 (6 bits, byte count = value + 1)
+  ///   block C[0]    = content_type_2 [5]
+  ///   block D[15:11]= content_type_2 [4:0]
+  ///   block D[10:5] = start_2 (6 bits)
+  ///   block D[4:0]  = length_2 (5 bits, byte count = value + 1)
+  /// ```
+  ///
+  /// We capture only `content_type ∈ {1, 4}` (item.title / item.artist)
+  /// and only when both `start + len + 1` falls inside the current RT
+  /// buffer length — broadcasters sometimes send RT+ ahead of the RT
+  /// they reference, in which case we'll re-pick it up on the next
+  /// retransmission (RT+ is sent every ~2 s).
+  fn process_rt_plus(&mut self, block_b: u16, block_c: u16, block_d: u16) {
+    let toggle = (block_b & 0x0010) != 0;
+    let running = (block_b & 0x0008) != 0;
+
+    // Toggle change → broadcaster started a new song. Discard the cached
+    // ranges so the UI doesn't briefly show the previous song's title
+    // mapped onto the (now half-overwritten) RT buffer.
+    if self.rt_plus_toggle != Some(toggle) {
+      self.rt_plus_title_range = None;
+      self.rt_plus_artist_range = None;
+      self.rt_plus_toggle = Some(toggle);
+    }
+    self.rt_plus_item_running = running;
+
+    // Tag 1: 6-bit content_type, 6-bit start, 6-bit length.
+    let ct1 = (((block_b & 0x0007) << 3) | ((block_c >> 13) & 0x0007)) as u8;
+    let start1 = ((block_c >> 7) & 0x003F) as u8;
+    let len1 = ((block_c >> 1) & 0x003F) as u8;
+
+    // Tag 2: 6-bit content_type, 6-bit start, 5-bit length.
+    let ct2 = (((block_c & 0x0001) << 5) | ((block_d >> 11) & 0x001F)) as u8;
+    let start2 = ((block_d >> 5) & 0x003F) as u8;
+    let len2 = (block_d & 0x001F) as u8;
+
+    self.update_rt_plus_tag(ct1, start1, len1);
+    self.update_rt_plus_tag(ct2, start2, len2);
+  }
+
+  /// Internal: route one (content_type, start, len) triple into the
+  /// title or artist slot, or drop it.
+  ///
+  /// The wire format encodes `byte_count = len + 1`, so we store
+  /// the raw `len` and let [`rt_plus_title`] / [`rt_plus_artist`]
+  /// add the `+1` at slice time.
+  fn update_rt_plus_tag(&mut self, content_type: u8, start: u8, len: u8) {
+    // Sanity-check the byte range against RT buffer geometry. The
+    // start field is 6-bit (0..=63) and length is at most 5 bits + 1
+    // (= 32) for tag 2 and 6 bits + 1 (= 64) for tag 1, so wraparound
+    // past `RT_MAX_LEN` is the only failure mode worth filtering.
+    let end = usize::from(start) + usize::from(len) + 1;
+    if end > RT_MAX_LEN {
+      return;
+    }
+    match content_type {
+      RT_PLUS_CT_ITEM_TITLE => self.rt_plus_title_range = Some((start, len)),
+      RT_PLUS_CT_ITEM_ARTIST => self.rt_plus_artist_range = Some((start, len)),
+      _ => {}
+    }
+  }
+
+  /// True when the broadcaster signalled that the cached title/artist
+  /// pair currently applies (i.e. song is in progress).
+  ///
+  /// Goes back to `false` between songs and during station IDs, in
+  /// which case [`rt_plus_title`] / [`rt_plus_artist`] will return
+  /// `None` so the UI hides the chip until the next song starts.
+  pub fn rt_plus_item_running(&self) -> bool {
+    self.rt_plus_item_running
+  }
+
+  /// True if at least one group 3A AID announcement for RT+ has been
+  /// observed on the current station, i.e. RT+ is supported here.
+  ///
+  /// Useful for diagnostics; the UI can fall back to the regular RT
+  /// scroller when this is `false`.
+  pub fn rt_plus_supported(&self) -> bool {
+    self.rt_plus_aid_group.is_some()
+  }
+
+  /// Decode the RT+ "item title" tag into a heap [`String`].
+  ///
+  /// Returns `None` when:
+  /// - RT+ has not yet been seen on this station, or
+  /// - the broadcaster cleared the "item running" bit, or
+  /// - the title's byte range is no longer covered by the current
+  ///   RT buffer (can happen for ~2 s after a song change before
+  ///   the new RT has been fully reassembled).
+  pub fn rt_plus_title(&self) -> Option<String> {
+    self.rt_plus_slice(self.rt_plus_title_range)
+  }
+
+  /// Decode the RT+ "item artist" tag into a heap [`String`].
+  /// See [`rt_plus_title`] for the `None` cases.
+  pub fn rt_plus_artist(&self) -> Option<String> {
+    self.rt_plus_slice(self.rt_plus_artist_range)
+  }
+
+  /// Internal: slice the RT buffer using a `(start, len)` pair and
+  /// run it through the regular RDS text decoder so UTF-8 / GB2312 /
+  /// Latin-1 stations all render correctly.
+  fn rt_plus_slice(&self, range: Option<(u8, u8)>) -> Option<String> {
+    if !self.rt_plus_item_running {
+      return None;
+    }
+    let (start, len) = range?;
+    let begin = usize::from(start);
+    let end = begin + usize::from(len) + 1; // wire len = byte_count - 1
+    // Refuse to slice past the RT we've actually received — broadcasters
+    // sometimes ship RT+ tags before the RT segments they point into.
+    if end > self.rt_len {
+      return None;
+    }
+    let decoded = decode_rds_text(&self.rt_buf[begin..end]);
+    if decoded.is_empty() {
+      None
+    } else {
+      Some(decoded)
+    }
   }
 }
 

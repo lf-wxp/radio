@@ -221,6 +221,16 @@ pub struct RadioState {
   pub station_name: String,
   /// Decoded RDS RT (RadioText) message; empty when station does not broadcast RT.
   pub radio_text: String,
+  /// RT+ "item title" — song / programme title parsed out of the RT
+  /// buffer using the broadcaster-supplied (start, len) tag. `None`
+  /// when the station does not transmit RT+ or while the broadcaster
+  /// has signalled that no song is currently in progress (the
+  /// "item-running" bit is clear). UI code typically renders
+  /// `“{artist} — {title}”` only when both fields are present and
+  /// falls back to the raw RT scroller otherwise.
+  pub rt_plus_title: Option<String>,
+  /// RT+ "item artist" — see [`Self::rt_plus_title`].
+  pub rt_plus_artist: Option<String>,
   /// Local time `(hour, minute)` decoded from RDS CT, or `None` until
   /// the first valid CT frame is received on the current station.
   pub clock_hh_mm: Option<(u8, u8)>,
@@ -302,6 +312,8 @@ impl RadioState {
       auto_mono: false,
       station_name: String::new(),
       radio_text: String::new(),
+      rt_plus_title: None,
+      rt_plus_artist: None,
       clock_hh_mm: None,
       pty_label: None,
       af_count: 0,
@@ -458,6 +470,24 @@ pub async fn publish_radio_text(text: String) {
   let mut state = RADIO_STATE.lock().await;
   state.radio_text = text;
   state.dirty = true;
+}
+
+/// Update the shared RT+ (RadioText Plus) tag pair.
+///
+/// Both fields move together: a station that publishes one half of the
+/// pair without the other is rare in practice, and treating them
+/// atomically lets the UI flip from "raw RT scroller" to "artist — title
+/// chip" in a single dirty tick.
+///
+/// Pass `(None, None)` when the broadcaster clears the "item running"
+/// bit (between songs / during station IDs) so the UI hides the chip.
+pub async fn publish_rt_plus(title: Option<String>, artist: Option<String>) {
+  let mut state = RADIO_STATE.lock().await;
+  if state.rt_plus_title != title || state.rt_plus_artist != artist {
+    state.rt_plus_title = title;
+    state.rt_plus_artist = artist;
+    state.dirty = true;
+  }
 }
 
 /// Update the shared local clock snapshot.

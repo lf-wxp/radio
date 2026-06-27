@@ -24,7 +24,7 @@ use crate::state::{
   DEFAULT_FREQ_X10, INPUT_CMDS, LAST_TUNED_DEBOUNCE_MS, LONG_PRESS_MS, OTA_CMDS, OtaCommand,
   RADIO_STATE, RadioCommand, STATION_NAME_PLACEHOLDER, TUNE_STEP_X10, ULTRA_LONG_PRESS_MS,
   clamp_freq, publish_af_status, publish_clock, publish_freq, publish_presets, publish_pty,
-  publish_radio_text, publish_station_name,
+  publish_radio_text, publish_rt_plus, publish_station_name,
 };
 
 /// Tracks wall-clock time derived from RDS Group 4A (Clock-Time).
@@ -632,6 +632,7 @@ async fn apply_tuned(
   publish_freq(freq_x10).await;
   publish_station_name(String::from(STATION_NAME_PLACEHOLDER)).await;
   publish_radio_text(String::new()).await;
+  publish_rt_plus(None, None).await;
   publish_clock(None).await;
   publish_pty(None).await;
   // Only update preset indicator when the active slot actually changes
@@ -721,6 +722,7 @@ async fn handle_command(
             publish_freq(target).await;
             publish_station_name(String::from(STATION_NAME_PLACEHOLDER)).await;
             publish_radio_text(String::new()).await;
+            publish_rt_plus(None, None).await;
             publish_clock(None).await;
             publish_pty(None).await;
             publish_presets(preset_store.snapshot(), target).await;
@@ -766,6 +768,7 @@ async fn seek(
       publish_freq(freq).await;
       publish_station_name(String::from(STATION_NAME_PLACEHOLDER)).await;
       publish_radio_text(String::new()).await;
+      publish_rt_plus(None, None).await;
       publish_clock(None).await;
       publish_pty(None).await;
       publish_presets(preset_store.snapshot(), freq).await;
@@ -851,6 +854,15 @@ async fn refresh_status(
     }
   }
 
+  // RT+ tags are derived from the *current* RT buffer, so harvest them
+  // after `process` has had a chance to absorb the latest group. The
+  // decoder returns `None` between songs (item-running bit clear) and
+  // while the title/artist range falls outside the partial RT — in
+  // both cases we want the UI to fall back to the raw RT scroller, so
+  // we forward the `Option`s verbatim.
+  let rt_plus_title = ctx.rds.rt_plus_title();
+  let rt_plus_artist = ctx.rds.rt_plus_artist();
+
   // Compute the latest local clock snapshot (if we have one) so the UI
   // sees the minute hand advance even between CT bursts.
   let clock_snapshot = ctx
@@ -874,6 +886,12 @@ async fn refresh_status(
   if state.radio_text != *ctx.last_rds_text {
     state.radio_text.clear();
     state.radio_text.push_str(ctx.last_rds_text);
+  }
+  if state.rt_plus_title != rt_plus_title {
+    state.rt_plus_title = rt_plus_title;
+  }
+  if state.rt_plus_artist != rt_plus_artist {
+    state.rt_plus_artist = rt_plus_artist;
   }
   if state.clock_hh_mm != clock_snapshot {
     state.clock_hh_mm = clock_snapshot;
@@ -1077,6 +1095,7 @@ async fn run_af_probe(
   publish_freq(target).await;
   publish_station_name(String::from(STATION_NAME_PLACEHOLDER)).await;
   publish_radio_text(String::new()).await;
+  publish_rt_plus(None, None).await;
   publish_clock(None).await;
   publish_pty(None).await;
   publish_presets(preset_store.snapshot(), target).await;

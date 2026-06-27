@@ -307,7 +307,8 @@ cargo make ui-preview-data
 | UTF-8（RDS 扩展）               | ✅    | 通过引导序列自动识别。 |
 | 交通通告 (TA)                   | 🟡    | 已解码，UI 暂未呈现。 |
 | 时间码 (CT)                     | ✅    | 解码自 group 4A，顶栏以 `HH:MM` 呈现（已叠加本地时区偏移）。 |
-| 备用频率 (RDS-AF)               | ⏳    | 计划中。 |
+| 备用频率 (RDS-AF)               | ✅    | Group 0A block C 已解析；RSSI 连续 5 s ≤18 时探测并切换最强 AF，PI 不匹配自动回滚。 |
+| RadioText Plus (RT+, AID 0x4BD7)| ✅    | Group 3A 注册 ODA、group 11A 承载标签；广播时 "now playing" chip 显示 `{歌手} — {歌名}`。 |
 
 ✅ 已上线 · 🟡 部分支持 · ⏳ 规划中
 
