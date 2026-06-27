@@ -348,6 +348,12 @@ pub enum OtaProgress {
   /// New image staged successfully; waiting for a manual reboot.
   Success,
   /// Update aborted. The running image is unchanged.
+  ///
+  /// The reason string **must** be a compile-time `&'static str` literal
+  /// (not a `Box::leak`-ed dynamic string). `publish_ota_progress` relies
+  /// on `PartialEq` to deduplicate publishes, and `&'static str` equality
+  /// compares content — but pointer-interning assumptions in future
+  /// optimisations could break if dynamic strings are introduced.
   Failed(&'static str),
 }
 

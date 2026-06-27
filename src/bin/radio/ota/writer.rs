@@ -162,19 +162,32 @@ impl<'d> OtaWriter<'d> {
   /// chunked-transfer-encoded HTTP).
   ///
   /// # Errors
+  ///
+  /// Returns `(OtaError, FlashStorage)` on failure so the caller can
+  /// always recover the flash handle without resorting to `unsafe`.
+  ///
   /// - [`OtaError::SlotNotFound`] if no inactive OTA partition exists.
   /// - [`OtaError::ImageTooLarge`] if `expected_size > slot_size`.
   /// - [`OtaError::Partition`] for partition-table parse failures.
-  pub fn begin(mut flash: FlashStorage<'d>, expected_size: Option<u32>) -> Result<Self, OtaError> {
-    let (target_slot, slot_base, slot_size) = determine_target(&mut flash)?;
+  pub fn begin(
+    mut flash: FlashStorage<'d>,
+    expected_size: Option<u32>,
+  ) -> Result<Self, (OtaError, FlashStorage<'d>)> {
+    let (target_slot, slot_base, slot_size) = match determine_target(&mut flash) {
+      Ok(t) => t,
+      Err(e) => return Err((e, flash)),
+    };
 
     if let Some(size) = expected_size
       && size > slot_size
     {
-      return Err(OtaError::ImageTooLarge {
-        image_size: size,
-        slot_size,
-      });
+      return Err((
+        OtaError::ImageTooLarge {
+          image_size: size,
+          slot_size,
+        },
+        flash,
+      ));
     }
 
     info!(
@@ -223,7 +236,14 @@ impl<'d> OtaWriter<'d> {
       let take = remaining.len().min(space);
       self.sector_buf[self.buf_used..self.buf_used + take].copy_from_slice(&remaining[..take]);
       self.buf_used += take;
-      self.accepted_bytes = self.accepted_bytes.saturating_add(take as u32);
+      self.accepted_bytes =
+        self
+          .accepted_bytes
+          .checked_add(take as u32)
+          .ok_or(OtaError::ImageTooLarge {
+            image_size: u32::MAX,
+            slot_size: self.slot_size,
+          })?;
       remaining = &remaining[take..];
 
       // Validate the image header as soon as we've accumulated enough
@@ -276,34 +296,46 @@ impl<'d> OtaWriter<'d> {
   /// handle.
   ///
   /// # Errors
+  ///
+  /// Returns `(OtaError, FlashStorage)` on failure so the caller can
+  /// always recover the flash handle without resorting to `unsafe`.
+  ///
   /// - [`OtaError::SizeMismatch`] if `expected_size` was given and does not
   ///   match `accepted_bytes`.
   /// - [`OtaError::Flash`] for the final program / OTA-data write.
   /// - [`OtaError::Partition`] for OTA-data parse failures.
-  pub fn finalize(mut self) -> Result<FlashStorage<'d>, OtaError> {
+  pub fn finalize(mut self) -> Result<FlashStorage<'d>, (OtaError, FlashStorage<'d>)> {
     // Defence in depth: a stream that ends before HEADER_LEN bytes is
     // certainly not a valid image. `verify_image_header` is normally hit
     // inside `write_chunk`; this branch covers truncated downloads.
     if !self.header_verified {
-      return Err(OtaError::BadImageHeader {
-        magic: self.sector_buf.first().copied().unwrap_or(0),
-        chip_id: 0,
-      });
+      return Err((
+        OtaError::BadImageHeader {
+          magic: self.sector_buf.first().copied().unwrap_or(0),
+          chip_id: 0,
+        },
+        self.flash,
+      ));
     }
 
     if let Some(expected) = self.expected_size
       && expected != self.accepted_bytes
     {
-      return Err(OtaError::SizeMismatch {
-        expected,
-        received: self.accepted_bytes,
-      });
+      return Err((
+        OtaError::SizeMismatch {
+          expected,
+          received: self.accepted_bytes,
+        },
+        self.flash,
+      ));
     }
 
     // Tail bytes (if any) get flushed with their 0xFF padding; the
     // bootloader image format allows trailing 0xFF.
-    if self.buf_used > 0 {
-      self.flush_sector()?;
+    if self.buf_used > 0
+      && let Err(e) = self.flush_sector()
+    {
+      return Err((e, self.flash));
     }
 
     info!(
@@ -317,12 +349,19 @@ impl<'d> OtaWriter<'d> {
     // budget that's enforced crate-wide.
     let mut pt_buf = pt_buffer();
     let pt_arr = pt_buf_as_array(&mut pt_buf);
-    let mut updater = OtaUpdater::new(&mut self.flash, pt_arr)?;
-    updater.activate_next_partition()?;
+    let mut updater = match OtaUpdater::new(&mut self.flash, pt_arr) {
+      Ok(u) => u,
+      Err(e) => return Err((e.into(), self.flash)),
+    };
+    if let Err(e) = updater.activate_next_partition() {
+      return Err((e.into(), self.flash));
+    }
     // Mark the freshly activated image as `New` so the bootloader's
     // rollback machinery (if enabled) knows to flip to `PendingVerify`
     // on first boot.
-    updater.set_current_ota_state(OtaImageState::New)?;
+    if let Err(e) = updater.set_current_ota_state(OtaImageState::New) {
+      return Err((e.into(), self.flash));
+    }
     // (no explicit drop: OtaUpdater holds only borrows.)
 
     Ok(self.flash)

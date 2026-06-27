@@ -98,21 +98,11 @@ pub async fn run_job(
   // partition table) but we still need to surface it.
   let writer = match OtaWriter::begin(flash, None) {
     Ok(w) => w,
-    Err(e) => {
+    Err((e, flash)) => {
       warn!("OTA begin failed: {:?}", e);
-      // SAFETY (logical): begin() consumes the flash handle on success
-      // *only*. Here we hit the early-return branch where the handle
-      // is dropped inside `begin`. We can't recover it; the caller's
-      // `resume()` will fail. This is a pre-existing limitation of
-      // the esp-storage singleton API; callers must therefore treat
-      // a Failed terminal state on this branch as "needs reboot".
       publish_ota_progress(OtaProgress::Failed("init")).await;
       publish_ota_in_progress(false).await;
-      // Re-take the singleton; this works because esp-storage's
-      // FlashStorage is a thin wrapper around a steal-able peripheral
-      // handle. Equivalent in spirit to `unsafe { steal() }` but
-      // exposed safely as `new()`.
-      return FlashStorage::new(unsafe { esp_hal::peripherals::FLASH::steal() });
+      return flash;
     }
   };
 
@@ -147,20 +137,16 @@ async fn run_download(
       publish_ota_progress(OtaProgress::Success).await;
       flash
     }
-    Err(e) => {
+    Err((e, flash)) => {
       warn!("OTA finalize failed: {:?}", e);
       publish_ota_progress(OtaProgress::Failed("activate")).await;
-      // `finalize` consumed the writer; on error it returns the flash
-      // through the OtaError but we can't currently recover the
-      // handle from the error path. Re-steal the singleton to keep
-      // the preset store working. Same caveat as in `run_job`'s
-      // early-return branch.
-      FlashStorage::new(unsafe { esp_hal::peripherals::FLASH::steal() })
+      flash
     }
   }
 }
 
 /// Map a download-side error to a short, UI-friendly reason string.
+#[must_use]
 fn http_failure_reason(e: &http_download::HttpError) -> &'static str {
   use http_download::HttpError;
   match e {

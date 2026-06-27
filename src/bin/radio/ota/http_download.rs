@@ -329,6 +329,10 @@ pub async fn download_to_writer<'d>(
         "OTA connect timed out after {} s",
         CONNECT_TIMEOUT.as_secs()
       );
+      // Explicitly abort the socket so the underlying TCP state machine
+      // releases its slot immediately rather than lingering in a half-open
+      // state until the next garbage-collection pass.
+      socket.abort();
       return Err(HttpError::ConnectFailed);
     }
   }
@@ -346,7 +350,11 @@ pub async fn download_to_writer<'d>(
 
   // Header-collection phase: read into a growable buffer until we
   // spot \r\n\r\n. A simple cap defends against runaway responses.
-  let mut head_buf: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(READ_CHUNK);
+  // Pre-allocate the full HEADER_LIMIT capacity up-front so we never
+  // trigger a realloc on the embedded heap (which could fragment the
+  // allocator). Real HTTP headers are well under 4 KiB; the single
+  // allocation is predictable and freed as soon as streaming begins.
+  let mut head_buf: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(HEADER_LIMIT);
   let response_head = loop {
     match socket.read(chunk).await {
       Ok(0) => return Err(HttpError::Truncated),
