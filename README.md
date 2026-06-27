@@ -501,6 +501,7 @@ recommended implementation sequence within each lane.
 - [x] Slint Material UI on ST7789
 - [x] On-device tests (`embedded-test`)
 - [x] RDS Clock-Time (CT) — auto-sync wall clock from group 4A
+- [x] SNTP wall clock — Cloudflare anycast time sync once Wi-Fi is up, with a monotonic-clock fallback so timestamps never go backwards
 - [x] RDS-AF alternative-frequency follow — PI-gated weak-signal probe
 - [x] LAN web console — phone-friendly single-page UI + JSON API on port 80
 - [x] mDNS responder — reach the console at `http://esp-radio.local/`
@@ -526,6 +527,7 @@ working days.
 | ✅  | mDNS broadcast `esp-radio.local`                            | 1 d    | Passive A-record responder on `224.0.0.251:5353`; pairs with #7 so the user can browse `http://esp-radio.local/`. Shipped 2026-06. |
 | ✅  | RDS listening log (rolling buffer of PS/RT/RSSI)            | 1 d    | 64-entry in-RAM ring buffer sampled every 10 s; rendered by the web console under "Listening log". Flash persistence intentionally deferred to keep #11's flash budget. Shipped 2026-06. |
 | ✅  | OTA firmware update                                         | 3 d    | End-to-end shipped 2026-06: GPT partition table, sector-buffered `OtaWriter` (reuses `esp-bootloader-esp-idf::OtaUpdater`), HTTP downloader, ESP image-header verifier, web-console trigger (`POST /api/ota`), and a fullscreen Slint progress overlay on the LCD. `cargo make ota-serve` runs an in-tree Rust dev server with QR code; tracking notes in [docs/ota-design.md](./docs/ota-design.md). |
+| ⏳  | Sleep timer / scheduled mute                                | 2 d    | Now feasible since SNTP gives a reliable wall clock. Adds an opt-in countdown (mute + LCD dim after N minutes) and an optional daily on/off schedule persisted in the `storage` partition. Open for contributors — needs a small UI surface (web console toggle, LCD overlay) more than it needs new firmware plumbing. |
 
 ### 🚫 Out of scope on current hardware
 
@@ -544,16 +546,14 @@ on the roadmap:
   Rust BLE controller in `esp-radio` does not yet expose Isochronous
   Channels and there is no LC3 encoder on `crates.io`. Re-evaluate
   when both upstream stacks ship the missing pieces.
-- BLE HID remote control — superseded by the LAN web console (#7);
-  pairing per phone, no on-screen feedback, and zero functions the
-  web UI cannot already do. Not worth the BLE-coex maintenance cost.
+- BLE HID remote control — superseded by the shipped LAN web
+  console: pairing per phone, no on-screen feedback, and zero
+  functions the web UI cannot already do. Not worth the BLE-coex
+  maintenance cost.
 - Real-time audio FFT spectrum — no audio ADC path on the board.
 - Touch-driven UI menus — current ST7789 module has no touch layer.
 - Battery fuel-gauge widget — depends on a battery-monitor IC the
   reference board does not expose.
-- Sleep timer / alarm clock — would lean on the RDS-CT wall clock,
-  which is unreliable on stations that don't broadcast group 4A;
-  not worth the extra UI mode given the use case.
 
 ### 📑 Design documents
 
