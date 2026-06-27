@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use crate::diagnostics::{self, HealthDto};
 use crate::state::{
   INPUT_CMDS, OTA_CMDS, OtaCommand, OtaProgress, PRESET_EMPTY, RADIO_STATE, RadioCommand,
-  publish_web_ip,
+  is_ps_unknown, publish_web_ip,
 };
 
 // ============================================================================
@@ -368,13 +368,25 @@ fn build_preset_slots(
 fn decode_preset_ps(buf: &[u8; 8]) -> Option<alloc::string::String> {
   // All-zero / all-blank means "unknown" — see PresetSet::ps for the
   // sentinel definition.
-  if buf.iter().all(|&b| b == 0 || b == b' ') {
+  if is_ps_unknown(buf) {
     return None;
   }
-  // Lossy UTF-8 keeps the JSON valid even when broadcasters use
+  // Trim NUL / space padding on the raw bytes *before* the lossy
+  // ASCII conversion, so we never accidentally strip a '?' that was
+  // substituted for a meaningful high-bit byte at the edges.
+  let start = buf.iter().position(|&b| b != 0 && b != b' ').unwrap_or(0);
+  let end = buf
+    .iter()
+    .rposition(|&b| b != 0 && b != b' ')
+    .map_or(0, |i| i + 1);
+  let trimmed_bytes = &buf[start..end];
+  if trimmed_bytes.is_empty() {
+    return None;
+  }
+  // Lossy ASCII keeps the JSON valid even when broadcasters use
   // Latin-1 / GB2312 high-bit code points (which Si4703 just hands
-  // through). Trimming strips RDS pad chars on both ends.
-  let s: alloc::string::String = buf
+  // through). Only non-printable-ASCII bytes are replaced with '?'.
+  let s: alloc::string::String = trimmed_bytes
     .iter()
     .map(|&b| {
       if (0x20..=0x7E).contains(&b) {
@@ -384,12 +396,7 @@ fn decode_preset_ps(buf: &[u8; 8]) -> Option<alloc::string::String> {
       }
     })
     .collect();
-  let trimmed = s.trim_matches(|c: char| c == ' ' || c == '?' || c == '\0');
-  if trimmed.is_empty() {
-    None
-  } else {
-    Some(alloc::string::String::from(trimmed))
-  }
+  if s.is_empty() { None } else { Some(s) }
 }
 
 /// `GET /api/state` — return a JSON snapshot of [`RADIO_STATE`].

@@ -182,9 +182,8 @@ impl<'d> PresetStore<'d> {
   /// in-memory snapshot is left untouched in that case.
   #[allow(
     dead_code,
-    reason = "thin wrapper kept for public API symmetry; \
-                                live callers use save_freq_with_meta to \
-                                also capture RDS PI/PS atomically."
+    reason = "thin wrapper kept for public API symmetry; live callers \
+              use save_freq_with_meta to also capture RDS PI/PS atomically."
   )]
   pub fn save_freq(&mut self, freq_x10: u16) -> Result<Option<usize>, PresetStoreError> {
     self.save_freq_with_meta(freq_x10, None, None)

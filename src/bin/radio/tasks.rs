@@ -21,10 +21,11 @@ use radio::si4703::{RdsClockTime, RdsDecoder, SeekDirection, Si4703};
 use crate::ota;
 use crate::presets::PresetStore;
 use crate::state::{
-  DEFAULT_FREQ_X10, INPUT_CMDS, LAST_TUNED_DEBOUNCE_MS, LONG_PRESS_MS, OTA_CMDS, OtaCommand,
-  RADIO_STATE, RadioCommand, SPECTRUM_LEN, STATION_NAME_PLACEHOLDER, TUNE_STEP_X10,
-  ULTRA_LONG_PRESS_MS, clamp_freq, publish_af_status, publish_clock, publish_freq, publish_presets,
-  publish_pty, publish_radio_text, publish_rt_plus, publish_spectrum, publish_station_name,
+  DEFAULT_FREQ_X10, INPUT_CMDS, LAST_TUNED_DEBOUNCE_MS, LONG_PRESS_MS, META_FILL_INTERVAL_MS,
+  OTA_CMDS, OtaCommand, RADIO_STATE, RadioCommand, SPECTRUM_LEN, STATION_NAME_PLACEHOLDER,
+  TUNE_STEP_X10, ULTRA_LONG_PRESS_MS, clamp_freq, is_ps_unknown, publish_af_status, publish_clock,
+  publish_freq, publish_presets, publish_pty, publish_radio_text, publish_rt_plus,
+  publish_spectrum, publish_station_name,
 };
 
 /// Tracks wall-clock time derived from RDS Group 4A (Clock-Time).
@@ -454,6 +455,11 @@ pub async fn radio_control_task(
   // instant is older than `LAST_TUNED_DEBOUNCE_MS` we flush it.
   let mut last_tuned_pending: Option<(u16, Instant)> = None;
 
+  // Throttle for the background metadata-fill loop: we only attempt a
+  // flash write at most once every `META_FILL_INTERVAL_MS` to avoid
+  // churning CPU on the common "nothing changed" path.
+  let mut last_meta_fill: Option<Instant> = None;
+
   // The preset store owns the singleton flash handle. We wrap it in an
   // `Option` so the OTA path can `take()` the store, surrender the
   // flash to [`crate::ota::run_job`] for the duration of the download,
@@ -524,8 +530,14 @@ pub async fn radio_control_task(
         // Lazy back-fill of cached PI / PS for the active preset
         // (no-op when current freq isn't saved or RDS hasn't
         // produced anything new — see `update_meta` for the diff).
-        let current_freq = RADIO_STATE.lock().await.freq_mhz_x10;
-        fill_preset_metadata_if_due(store, &rds, current_freq).await;
+        // Single lock acquisition for both freq and OTA guard.
+        let (current_freq, ota_active) = {
+          let st = RADIO_STATE.lock().await;
+          (st.freq_mhz_x10, st.ota_in_progress)
+        };
+        if !ota_active {
+          fill_preset_metadata_if_due(store, &rds, current_freq, &mut last_meta_fill).await;
+        }
       }
       Either3::Third(cmd) => {
         crate::diagnostics::watchdog_feed();
@@ -628,7 +640,7 @@ fn flush_last_tuned_if_due(store: &mut PresetStore<'static>, pending: &mut Optio
 /// us round-trip through flash without an extra UTF-8 decode step.
 fn preset_ps_snapshot(ps_name: &[u8; 8]) -> Option<[u8; 8]> {
   // ASCII space is the RDS pad character; treat it the same as 0.
-  if ps_name.iter().all(|&b| b == 0 || b == b' ') {
+  if is_ps_unknown(ps_name) {
     return None;
   }
   Some(*ps_name)
@@ -636,24 +648,25 @@ fn preset_ps_snapshot(ps_name: &[u8; 8]) -> Option<[u8; 8]> {
 
 /// Lazily back-fill the cached PI / PS for the currently tuned preset.
 ///
-/// Runs on the same 200 ms tick as [`flush_last_tuned_if_due`]. The
-/// goal is to make sure that, the second time a listener tunes back
-/// to a saved preset, the preset's stored label reflects whatever
-/// RDS has decoded since the original `SavePreset` was issued (PS
-/// names commonly take 5–10 s to fully scroll, so an "atomic" capture
-/// at save time misses it on freshly-tuned stations).
+/// Runs on the same 200 ms tick as [`flush_last_tuned_if_due`], but
+/// throttled to at most once per [`META_FILL_INTERVAL_MS`] to avoid
+/// churning CPU on the common "nothing changed" path. The goal is to
+/// make sure that, the second time a listener tunes back to a saved
+/// preset, the preset's stored label reflects whatever RDS has decoded
+/// since the original `SavePreset` was issued (PS names commonly take
+/// 5–10 s to fully scroll, so an "atomic" capture at save time misses
+/// it on freshly-tuned stations).
 ///
 /// Strategy:
 ///
+/// * Skip unless the throttle interval has elapsed.
 /// * Skip unless the current frequency is actually one of the saved
-///   slots — otherwise there's nothing to update and we'd just churn
-///   `try_lock` for no reason.
+///   slots — otherwise there's nothing to update.
 /// * Hand the new PI / PS to [`PresetStore::update_meta`], which is
 ///   responsible for the diff and only erases flash when something
 ///   has genuinely changed.
-/// * Honour the OTA interlock the same way `flush_last_tuned_if_due`
-///   does: while flash is loaned to the OTA writer, skip the write
-///   and try again on the next idle tick.
+/// * OTA interlock is handled by the caller — this function is only
+///   invoked when `ota_in_progress == false`.
 ///
 /// Failures are non-fatal; we log and move on so a flaky flash
 /// doesn't poison the rest of the tick.
@@ -661,15 +674,18 @@ async fn fill_preset_metadata_if_due(
   store: &mut PresetStore<'static>,
   rds: &RdsDecoder,
   current_freq_x10: u16,
+  last_fill: &mut Option<Instant>,
 ) {
+  // Throttle: skip if we checked recently.
+  if let Some(prev) = *last_fill {
+    if prev.elapsed() < Duration::from_millis(META_FILL_INTERVAL_MS) {
+      return;
+    }
+  }
+  *last_fill = Some(Instant::now());
+
   // Cheap pre-check: only go further when this freq is actually saved.
   if store.snapshot().position(current_freq_x10).is_none() {
-    return;
-  }
-  // OTA interlock — match flush_last_tuned_if_due's behaviour.
-  if let Ok(state) = RADIO_STATE.try_lock()
-    && state.ota_in_progress
-  {
     return;
   }
   let pi = rds.pi();

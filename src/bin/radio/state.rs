@@ -48,6 +48,16 @@ pub const MAX_PRESETS: usize = 8;
 /// can never collide with a real frequency.
 pub const PRESET_EMPTY: u16 = 0;
 
+/// Returns `true` when the 8-byte PS buffer holds the "unknown"
+/// sentinel (all zeros or all ASCII spaces). Used by both the flash
+/// write path ([`crate::tasks::preset_ps_snapshot`]) and the JSON
+/// serialisation path ([`crate::web::decode_preset_ps`]) to avoid
+/// duplicating the sentinel check.
+#[inline]
+pub fn is_ps_unknown(buf: &[u8; 8]) -> bool {
+  buf.iter().all(|&b| b == 0 || b == b' ')
+}
+
 /// Quiet-period (milliseconds) before persisting `last_tuned` to Flash.
 ///
 /// Tuning hammers the encoder; we coalesce bursts so we only write
@@ -55,6 +65,14 @@ pub const PRESET_EMPTY: u16 = 0;
 /// "tune then walk away" still saves before power-off, yet long enough
 /// to keep Flash erase counts in the low thousands across years of use.
 pub const LAST_TUNED_DEBOUNCE_MS: u64 = 30_000;
+
+/// Minimum interval between consecutive metadata-fill attempts.
+///
+/// 5 s is long enough for a full RDS PS name to scroll past (typically
+/// 4–8 s) while still being responsive enough that the UI label appears
+/// within one listen session. Keeps CPU and flash-check overhead to
+/// ~0.2 calls/s instead of the raw 5 Hz tick rate.
+pub const META_FILL_INTERVAL_MS: u64 = 5_000;
 
 /// Maximum number of stations remembered during the boot-time scan.
 pub const MAX_SCAN_STATIONS: usize = 20;
@@ -182,9 +200,9 @@ impl PresetSet {
   #[must_use]
   #[allow(
     dead_code,
-    reason = "public read-side API; consumed by host-tests \
-                                and future UI surfaces (LCD label) \
-                                that don't go through the web JSON path."
+    reason = "public read-side API reserved for future UI surfaces \
+              (LCD label rendering) that don't go through the web \
+              JSON path."
   )]
   pub fn pi_for(&self, idx: usize) -> Option<u16> {
     self.pi.get(idx).copied().filter(|&pi| pi != 0)
@@ -199,9 +217,9 @@ impl PresetSet {
   #[must_use]
   #[allow(
     dead_code,
-    reason = "public read-side API; consumed by host-tests \
-                                and future UI surfaces (LCD label) \
-                                that don't go through the web JSON path."
+    reason = "public read-side API reserved for future UI surfaces \
+              (LCD label rendering) that don't go through the web \
+              JSON path."
   )]
   pub fn ps_for(&self, idx: usize) -> Option<&[u8; 8]> {
     self.ps.get(idx).filter(|buf| buf.iter().any(|&b| b != 0))
