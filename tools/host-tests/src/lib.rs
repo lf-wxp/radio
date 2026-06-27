@@ -18,6 +18,7 @@
 //! | Module | Source of truth | What's tested |
 //! | --- | --- | --- |
 //! | [`mdns_parser`] | `src/bin/radio/mdns.rs` | mDNS query decode + response packet layout |
+//! | [`sntp`] | `src/bin/radio/clock/sntp.rs` | SNTPv4 packet encode + reply validation |
 //! | [`url_parser`] | `src/bin/radio/ota/http_download.rs` | `http://<ipv4>[:port]/path` parser |
 //! | [`text`] | `src/bin/radio/listening_log.rs` | UTF-8-safe slice clipping |
 //!
@@ -39,5 +40,6 @@
 #![allow(clippy::missing_errors_doc, clippy::module_name_repetitions)]
 
 pub mod mdns_parser;
+pub mod sntp;
 pub mod text;
 pub mod url_parser;

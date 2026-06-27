@@ -64,10 +64,12 @@
 
 extern crate alloc;
 
+mod clock;
 mod diagnostics;
 mod hardware;
 mod listening_log;
 mod mdns;
+mod ntp;
 mod ota;
 mod presets;
 mod state;
@@ -247,6 +249,17 @@ async fn main(spawner: Spawner) -> ! {
         }
         Err(_e) => {
           defmt::error!("Failed to spawn mDNS task: task arena full");
+        }
+      }
+      // SNTP client so the web console can render real timestamps
+      // once the LAN can reach the public NTP anycast IPs.
+      match ntp::ntp_task(stack) {
+        Ok(token) => {
+          spawner.spawn(token);
+          info!("NTP client armed (Cloudflare anycast)");
+        }
+        Err(_e) => {
+          defmt::error!("Failed to spawn ntp_task: task arena full");
         }
       }
     }

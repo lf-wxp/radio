@@ -539,13 +539,28 @@
           // Show newest first; the API returns oldest-first.
           const reversed = data.entries.slice().reverse();
           const newestUptime = reversed[0].uptime_secs;
+          // When the device has SNTP-synced (data.now_unix is set), we
+          // can pin each entry to a real wall-clock time. The math is:
+          //   wall_at_entry = now_unix - (newestUptime - entry.uptime_secs)
+          // because all uptime_secs values share the same boot epoch.
+          const haveWall = typeof data.now_unix === "number";
           for (const entry of reversed) {
             const li = document.createElement("li");
 
             const time = document.createElement("span");
             time.className = "col-time";
             const delta = Math.max(0, newestUptime - entry.uptime_secs);
-            time.textContent = fmtAgo(delta);
+            if (haveWall) {
+              const wallSecs = data.now_unix - delta;
+              const d = new Date(wallSecs * 1000);
+              const hh = String(d.getHours()).padStart(2, "0");
+              const mm = String(d.getMinutes()).padStart(2, "0");
+              time.textContent = `${hh}:${mm}`;
+              // Keep the relative form available on hover for context.
+              time.title = fmtAgo(delta);
+            } else {
+              time.textContent = fmtAgo(delta);
+            }
 
             const freq = document.createElement("span");
             freq.className = "col-freq";

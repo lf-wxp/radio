@@ -32,8 +32,9 @@ flowchart LR
     INPUT[input_task<br/>tasks.rs]
     RADIO[radio_control_task<br/>tasks.rs]
     LOGGER[logger_task<br/>tasks.rs]
-    WEB[web_task<br/>web.rs]
+WEB[web_task<br/>web.rs]
     MDNS[mdns_task<br/>mdns.rs]
+    NTP[ntp_task<br/>ntp.rs]
     UI[ui::run_loop<br/>main thread]
   end
 
@@ -82,8 +83,9 @@ primitives in `state.rs`.
 | `input_task` | [tasks.rs] | Aggregates rotary/button events into `RadioCommand` | PCNT delta, GPIO IRQ | `INPUT_CMDS` |
 | `radio_control_task` | [tasks.rs] | Owns the Si4703, flash and the OTA controller. Single writer of most fields in `RADIO_STATE`. | `INPUT_CMDS`, `OTA_CMDS`, RDS group reads | `RADIO_STATE`, flash writes, I²C tune, LCD refresh trigger |
 | `logger_task` | [tasks.rs] | Samples `RADIO_STATE` every 10 s, appends a row to the listening-log ring | `RADIO_STATE` | `LISTENING_LOG` |
-| `web_task` | [web.rs] | `picoserve` HTTP/1.1 server; renders the SPA and the JSON API | TCP, `RADIO_STATE`, `LISTENING_LOG` | `INPUT_CMDS`, `OTA_CMDS` |
+| `web_task` | [web.rs] | `picoserve` HTTP/1.1 server; renders the SPA and the JSON API | TCP, `RADIO_STATE`, `LISTENING_LOG`, `clock::wall_time_unix_secs` | `INPUT_CMDS`, `OTA_CMDS` |
 | `mdns_task` | [mdns.rs] | Passive A-record responder on `224.0.0.251:5353` | UDP multicast | UDP unicast reply |
+| `ntp_task` | [ntp.rs] | SNTPv4 client; anchors `clock` to UTC via Cloudflare anycast | UDP/123 → public NTP | `clock::record_sync` |
 | `ui::run_loop` | [main.rs] | Slint frame loop — reads `RADIO_STATE`, draws to LCD | `RADIO_STATE` | LCD framebuffer |
 
 [tasks.rs]: ./src/bin/radio/tasks.rs
@@ -156,8 +158,9 @@ sequenceDiagram
     WP->>WP: STA connect
   end
   WP-->>Main: ConnectedStation { stack, ssid }
-  Main->>Net: spawn web_task (port 80)
-  Main->>Net: spawn mdns_task (udp/5353)
+    Main->>Net: spawn web_task (port 80)
+    Main->>Net: spawn mdns_task (udp/5353)
+    Main->>Net: spawn ntp_task (udp/123)
   Main->>WP: into_flash() — return flash to Main
   Main->>FS: ota::mark_current_app_valid (anti-rollback)
   Main->>PS: open(flash) — flash now owned by PresetStore

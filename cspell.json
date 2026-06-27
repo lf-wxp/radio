@@ -51,6 +51,7 @@
         "SKSNR",
         "Slint",
         "smoltcp",
+        "sntp",
         "synchronisation",
         "SYSCFG",
         "Tdefmt",

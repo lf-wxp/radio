@@ -175,6 +175,13 @@ struct LogEntryDto {
 #[derive(Serialize)]
 struct LogDto {
   capacity: u16,
+  /// Current Unix epoch seconds, populated only after
+  /// [`crate::clock::wall_time_unix_secs`] returns `Some` (i.e.
+  /// SNTP has synced at least once this boot). The browser uses
+  /// this to render absolute timestamps; until it shows up the
+  /// front-end falls back to relative `mm:ss ago`.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  now_unix: Option<u64>,
   entries: alloc::vec::Vec<LogEntryDto>,
 }
 /// Body for `POST /api/tune`.
@@ -294,6 +301,7 @@ async fn handle_get_log() -> picoserve::response::Json<LogDto> {
     .collect();
   picoserve::response::Json(LogDto {
     capacity: crate::listening_log::LOG_CAPACITY as u16,
+    now_unix: crate::clock::wall_time_unix_secs(),
     entries,
   })
 }
