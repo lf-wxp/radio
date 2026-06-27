@@ -521,6 +521,11 @@ pub async fn radio_control_task(
         // instead of a third `select` arm. Worst-case latency is one
         // tick beyond the debounce window, which is fine.
         flush_last_tuned_if_due(store, &mut last_tuned_pending);
+        // Lazy back-fill of cached PI / PS for the active preset
+        // (no-op when current freq isn't saved or RDS hasn't
+        // produced anything new — see `update_meta` for the diff).
+        let current_freq = RADIO_STATE.lock().await.freq_mhz_x10;
+        fill_preset_metadata_if_due(store, &rds, current_freq).await;
       }
       Either3::Third(cmd) => {
         crate::diagnostics::watchdog_feed();
@@ -613,6 +618,78 @@ fn flush_last_tuned_if_due(store: &mut PresetStore<'static>, pending: &mut Optio
   *pending = None;
 }
 
+/// Convert the live RDS PS buffer into the form stored on flash.
+///
+/// Returns `Some(buf)` only when the broadcaster has actually sent at
+/// least one non-blank PS character; an all-zero or all-space buffer
+/// is reported as `None` so the cache stays at its "unknown" sentinel
+/// instead of being clobbered with whitespace. The eight-byte
+/// representation matches the wire format from RDS Group 0A and lets
+/// us round-trip through flash without an extra UTF-8 decode step.
+fn preset_ps_snapshot(ps_name: &[u8; 8]) -> Option<[u8; 8]> {
+  // ASCII space is the RDS pad character; treat it the same as 0.
+  if ps_name.iter().all(|&b| b == 0 || b == b' ') {
+    return None;
+  }
+  Some(*ps_name)
+}
+
+/// Lazily back-fill the cached PI / PS for the currently tuned preset.
+///
+/// Runs on the same 200 ms tick as [`flush_last_tuned_if_due`]. The
+/// goal is to make sure that, the second time a listener tunes back
+/// to a saved preset, the preset's stored label reflects whatever
+/// RDS has decoded since the original `SavePreset` was issued (PS
+/// names commonly take 5–10 s to fully scroll, so an "atomic" capture
+/// at save time misses it on freshly-tuned stations).
+///
+/// Strategy:
+///
+/// * Skip unless the current frequency is actually one of the saved
+///   slots — otherwise there's nothing to update and we'd just churn
+///   `try_lock` for no reason.
+/// * Hand the new PI / PS to [`PresetStore::update_meta`], which is
+///   responsible for the diff and only erases flash when something
+///   has genuinely changed.
+/// * Honour the OTA interlock the same way `flush_last_tuned_if_due`
+///   does: while flash is loaned to the OTA writer, skip the write
+///   and try again on the next idle tick.
+///
+/// Failures are non-fatal; we log and move on so a flaky flash
+/// doesn't poison the rest of the tick.
+async fn fill_preset_metadata_if_due(
+  store: &mut PresetStore<'static>,
+  rds: &RdsDecoder,
+  current_freq_x10: u16,
+) {
+  // Cheap pre-check: only go further when this freq is actually saved.
+  if store.snapshot().position(current_freq_x10).is_none() {
+    return;
+  }
+  // OTA interlock — match flush_last_tuned_if_due's behaviour.
+  if let Ok(state) = RADIO_STATE.try_lock()
+    && state.ota_in_progress
+  {
+    return;
+  }
+  let pi = rds.pi();
+  let ps = preset_ps_snapshot(rds.station_name());
+  if pi.is_none() && ps.is_none() {
+    return; // nothing new to commit
+  }
+  match store.update_meta(current_freq_x10, pi, ps) {
+    Ok(true) => {
+      info!("Flash: preset meta updated for {}", current_freq_x10);
+      // Re-publish so the UI ("BBC R1" label on preset buttons)
+      // sees the freshly cached PS without waiting for the next
+      // tune-induced publish.
+      publish_presets(store.snapshot(), current_freq_x10).await;
+    }
+    Ok(false) => {} // no change — common path
+    Err(e) => info!("Flash: preset meta save failed: {}", e),
+  }
+}
+
 /// Common tail of a successful chip-side tune.
 ///
 /// Resets RDS state for the new station, publishes the fresh frequency
@@ -701,11 +778,19 @@ async fn handle_command(
       let current = radio_chip
         .current_frequency(i2c)
         .unwrap_or(DEFAULT_FREQ_X10);
-      match preset_store.save_freq(current) {
-        Ok(idx) => {
+      // If RDS has already locked while the listener was deciding to
+      // save, capture PI + PS atomically with the freq write so the
+      // first-ever record for this slot already has a friendly label.
+      // Otherwise the background metadata-fill loop will fill them
+      // in within a few seconds of the next tune-back.
+      let pi_snapshot = rds.pi();
+      let ps_snapshot = preset_ps_snapshot(rds.station_name());
+      match preset_store.save_freq_with_meta(current, pi_snapshot, ps_snapshot) {
+        Ok(Some(idx)) => {
           info!("Preset saved: freq={} slot={}", current, idx);
           publish_presets(preset_store.snapshot(), current).await;
         }
+        Ok(None) => info!("Preset save skipped (empty sentinel)"),
         Err(e) => info!("Preset save failed: {}", e),
       }
     }

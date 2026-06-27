@@ -601,17 +601,24 @@
           $("btnMute").textContent = s.muted ? "Unmute" : "Mute";
 
           // Render the preset chip strip. Empty slots get a disabled
-          // placeholder so the layout is stable across saves.
+          // placeholder so the layout is stable across saves. When the
+          // device has cached an RDS PS name for the slot we show the
+          // friendly label (e.g. "BBC R1") instead of the numeric
+          // frequency; the title attribute keeps the frequency
+          // discoverable on hover for both mouse and screen-reader use.
           const wrap = $("presets");
           wrap.innerHTML = "";
-          s.presets.forEach((freq, idx) => {
+          s.presets.forEach((slot, idx) => {
             const btn = document.createElement("button");
+            const freq = slot.freq;
             if (freq === 0) {
               btn.textContent = "\u00b7";
               btn.disabled = true;
             } else {
               const [pi, pd] = fmtFreq(freq);
-              btn.textContent = `${pi}.${pd}`;
+              const freqLabel = `${pi}.${pd}`;
+              btn.textContent = slot.ps ? slot.ps : freqLabel;
+              btn.title = slot.ps ? `${slot.ps} \u2022 ${freqLabel}` : freqLabel;
               if (s.preset_idx === idx) btn.classList.add("active");
               btn.addEventListener("click", () =>
                 post("/api/tune", { freq_x10: freq }),

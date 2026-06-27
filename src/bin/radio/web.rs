@@ -94,8 +94,14 @@ struct StateDto {
   af_count: u8,
   af_following: bool,
   preset_idx: Option<u8>,
-  /// Saved preset frequencies in MHz × 10. `0` for empty slots.
-  presets: [u16; crate::state::MAX_PRESETS],
+  /// Saved preset slots; one entry per [`crate::state::MAX_PRESETS`].
+  ///
+  /// Empty slots emit `{ "freq": 0 }` (no `ps` field). Populated slots
+  /// always carry `freq`; `ps` is present iff the broadcaster's RDS
+  /// PS name has been decoded at least once for that slot, in which
+  /// case the front-end shows it as a friendly label (e.g. "BBC R1")
+  /// in place of the numeric frequency.
+  presets: [PresetSlotDto; crate::state::MAX_PRESETS],
   wifi_ssid: alloc::string::String,
   wifi_connected: bool,
   /// Latest snapshot of the OTA state machine. See [`OtaProgressDto`].
@@ -219,6 +225,25 @@ struct SpectrumDto {
   top_x10: u16,
 }
 
+/// One row in [`StateDto::presets`].
+///
+/// Kept tiny because the array is sized statically at
+/// [`crate::state::MAX_PRESETS`] and lives inside the per-request
+/// `Json<StateDto>` future on picoserve's task stack — every byte of
+/// per-slot inflation pushes the serializer closer to clippy's
+/// `large_stack_frames` threshold.
+///
+/// `freq` is in 0.1 MHz units (matching the rest of the wire format).
+/// `ps` is omitted when the slot is empty *or* when no RDS PS name
+/// has been decoded yet for that station; the front-end falls back
+/// to formatting `freq` as e.g. `101.5` in that case.
+#[derive(Serialize)]
+struct PresetSlotDto {
+  freq: u16,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  ps: Option<alloc::string::String>,
+}
+
 /// Body for `POST /api/tune`.
 #[derive(Deserialize)]
 struct TuneBody {
@@ -304,6 +329,69 @@ fn format_rt_plus(artist: Option<&str>, title: Option<&str>) -> Option<alloc::st
   }
 }
 
+/// Build the wire-format preset slot array from the in-memory snapshot.
+///
+/// Walks `presets.freqs` and pairs each frequency with the optional
+/// PS label cached in `presets.ps`. Empty slots (`freq == 0`) keep
+/// `ps == None` so the front-end short-circuits to its "empty slot"
+/// rendering without paying for a string allocation it would discard
+/// anyway.
+///
+/// PS bytes are decoded from the raw 8-byte RDS buffer with two
+/// transformations:
+///
+/// * leading / trailing ASCII whitespace and NUL padding stripped
+///   (broadcasters routinely zero-pad short names like `"BBC R1"`),
+/// * any non-ASCII bytes replaced with `?` via lossy UTF-8 (Si4703
+///   sometimes emits Latin-1 high-bit characters; the JSON wire
+///   format is UTF-8 only).
+///
+/// Returns `None` for the `ps` field when the trimmed buffer is empty
+/// — that's the same sentinel
+/// [`crate::state::PresetSet::ps_for`] uses to mean "unknown".
+fn build_preset_slots(
+  presets: &crate::state::PresetSet,
+) -> [PresetSlotDto; crate::state::MAX_PRESETS] {
+  core::array::from_fn(|i| {
+    let freq = presets.freqs[i];
+    let ps = if freq == crate::state::PRESET_EMPTY {
+      None
+    } else {
+      decode_preset_ps(&presets.ps[i])
+    };
+    PresetSlotDto { freq, ps }
+  })
+}
+
+/// Decode an 8-byte raw RDS PS buffer into a printable string for the
+/// JSON response, or `None` when the buffer holds the unknown sentinel.
+fn decode_preset_ps(buf: &[u8; 8]) -> Option<alloc::string::String> {
+  // All-zero / all-blank means "unknown" — see PresetSet::ps for the
+  // sentinel definition.
+  if buf.iter().all(|&b| b == 0 || b == b' ') {
+    return None;
+  }
+  // Lossy UTF-8 keeps the JSON valid even when broadcasters use
+  // Latin-1 / GB2312 high-bit code points (which Si4703 just hands
+  // through). Trimming strips RDS pad chars on both ends.
+  let s: alloc::string::String = buf
+    .iter()
+    .map(|&b| {
+      if (0x20..=0x7E).contains(&b) {
+        b as char
+      } else {
+        '?'
+      }
+    })
+    .collect();
+  let trimmed = s.trim_matches(|c: char| c == ' ' || c == '?' || c == '\0');
+  if trimmed.is_empty() {
+    None
+  } else {
+    Some(alloc::string::String::from(trimmed))
+  }
+}
+
 /// `GET /api/state` — return a JSON snapshot of [`RADIO_STATE`].
 ///
 /// Allocates two transient `String`s (PS / RT decoded text) per call;
@@ -339,7 +427,7 @@ async fn handle_get_state() -> picoserve::response::Json<StateDto> {
     af_count: state.af_count,
     af_following: state.af_following,
     preset_idx: state.preset_idx,
-    presets: state.presets.freqs,
+    presets: build_preset_slots(&state.presets),
     wifi_ssid: state.wifi_ssid.clone(),
     wifi_connected: state.wifi_connected,
     ota: state.ota_progress.into(),

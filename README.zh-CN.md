@@ -60,7 +60,7 @@
 - 📻 **FM 调谐** —— Si4703 通过 I²C 驱动，开机自动扫描并跳到信号最强的电台；UI 支持 RDS（PS 电台名 + RT 滚动文字，兼容 GB2312/UTF-8 扩展）。
 - 🔊 **音量与静音** —— 超长按编码器（≥ 2.5 s）可静音，UI 顶部带独立音量条。
 - 🎛️ **触感操作** —— KY-040 旋转编码器接入 ESP32-C6 的 **PCNT** 硬件外设，无中断抖动；旋转调台（带加速），短按 = 循环收藏台，长按（≥ 800 ms）= 保存当前频点。
-- ⭐ **Presets 收藏台 + 上电恢复** —— 可保存 8 个收藏台到 Flash（`esp-storage`）；下次开机自动调回上一次听的频率（带 30 s 防抖，避免 Flash 费压）。
+- ⭐ **Presets 收藏台 + 上电恢复** —— 可保存 8 个收藏台到 Flash（`esp-storage`，v2 表体同时缓存每个收藏台的 RDS PI 与 PS，Web 控制台上预置按钮会显示 `BBC R1` 而不是贤果 `97.7`）；下次开机自动调回上一次听的频率（带 30 s 防抖，避免 Flash 费压）。
 - 📶 **WiFi 配网** —— 首次开机弹出 SoftAP 强制门户页面，凭据由 `esp-storage` 写入 Flash，下次开机自动联网。
 - 🖥️ **Slint UI** —— 基于 Material-1.0 主题的 [`ui/radio_ui.slint`](./ui/radio_ui.slint)，软件渲染到 240×320 ST7789，可在 macOS / Linux / Windows 上离线预览。
 - 🔁 **Embassy 异步** —— 全程 `no_std`，`embassy-executor` + `embassy-sync` 在输入任务、电台控制任务、UI 渲染循环之间传递事件。
@@ -511,7 +511,7 @@ BLE 射频、Flash。工时为单人投入估算。
 | ✅  | 立体声指示 + 弱信号自动 mono                         | 0.5 天  | 读取 Si4703 `STATUSRSSI` bit 8，复用现成 `set_mono`。tasks.rs 中只点递进。      |
 | ✅  | RSSI 频谱图（“看图调台”）                            | 1 天    | 启动时一次 `sweep_rssi` 扫 87.5–108.0 MHz，52 格柱状图 + 当前频点高亮，LCD 与 Web 控制台两端都展示；Web 端新增 `GET /api/spectrum` 与 `Scan` 按钮（`POST /api/spectrum/scan`），可随时手动重新扫一遍。已于 2026-06 交付。 |
 | ✅  | 旋钮调台加速                                          | 0.25 天 | 按 detent 间隔动态选档（×1/×2/×3/×5），反转或 idle 超时自动重置。已于 2026-06 交付。 |
-| ✅  | 收藏台 Presets + 上电恢复上次频率                    | 1.5 天  | 写入 `storage` 分区（0x3E_0000）；短按循环收藏、长按保存、超长按静音。已于 2026-06 交付。 |
+| ✅  | 收藏台 Presets + 上电恢复上次频率                    | 1.5 天  | 写入 `storage` 分区（0x3E_0000）；短按循环收藏、长按保存、超长按静音。已于 2026-06 交付。v2 schema（2026-06）额外缓存 RDS PI + PS，Web 预置按钮优先显示 `BBC R1` 这类友好名；后台 metadata-fill 任务会为“保存时 RDS 还未锁”的槽位补上 PI/PS。Schema 是单向升级的 — 回滚到 v2 之前的固件会在下一次保存时抹除预置表。 |
 | ✅  | RDS-AF 备用频率自动跟随                              | 2 天    | Group 0A block C 解析、PI 校验；RSSI 连续 5 s ≤ 18 且存在 AF 列表时探测并跳到最强频点，PI 不匹配则回滚。已于 2026-06 交付。 |
 | ✅  | 局域网 Web 控制台（`/api/state`、`/api/tune`）       | 2 天    | 手机友好单页 HTML + JSON API，监听 80 端口；DHCP 完成后 LCD 底部显示访问 URL。已于 2026-06 交付。 |
 | ✅  | mDNS 广播 `esp-radio.local`                          | 1 天    | 监听 `224.0.0.251:5353` 的被动 A 记录响应器，配合 #7 让用户能在手机上直接访问 `http://esp-radio.local/`。已于 2026-06 交付。 |

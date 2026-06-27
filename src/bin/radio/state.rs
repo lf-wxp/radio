@@ -116,6 +116,25 @@ pub enum RadioCommand {
 ///
 /// On-disk persistence lives in `presets::storage::PresetStore`; this
 /// type is the in-memory mirror.
+///
+/// ## Metadata cache (schema v2)
+///
+/// In addition to the bare frequencies, every slot can optionally
+/// carry the RDS Programme Identification (`pi`) and Programme
+/// Service (`ps`) name decoded the last time the listener visited
+/// that station. They are populated lazily — either at the moment a
+/// preset is saved (if RDS has already locked) or shortly afterwards
+/// by a small background task that watches the live RDS feed and
+/// fills in any gaps the next time the listener tunes back. The UI
+/// uses `ps` (when present) as a friendly label on preset buttons so
+/// the user sees `BBC R1` instead of the raw `97.7` digits.
+///
+/// Sentinel values:
+/// - `pi[i] == 0` means PI is unknown for slot `i` (real PI codes
+///   never use 0; the RDS spec reserves it for "no PI yet").
+/// - `ps[i] == [0; 8]` means PS is unknown for slot `i`. Real PS names
+///   are 8 ASCII-printable chars (or `0x20` padding) so an all-zero
+///   buffer is unambiguous.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PresetSet {
   /// Frequencies in MHz x 10. Empty slots hold [`PRESET_EMPTY`].
@@ -123,6 +142,15 @@ pub struct PresetSet {
   /// Last tuned frequency (MHz x 10), restored on next boot.
   /// `0` means "unset" — fall back to the boot scan in that case.
   pub last_tuned: u16,
+  /// Cached RDS Programme Identification per slot (`0` = unknown).
+  pub pi: [u16; MAX_PRESETS],
+  /// Cached RDS Programme Service name per slot.
+  ///
+  /// Each entry is the 8-byte raw PS buffer (ASCII / Latin-1 with
+  /// `0x20` padding). `[0; 8]` means unknown. We store the raw bytes
+  /// rather than a decoded `String` so the type stays [`Copy`] and
+  /// matches the on-Flash schema 1:1.
+  pub ps: [[u8; 8]; MAX_PRESETS],
 }
 
 impl PresetSet {
@@ -132,6 +160,8 @@ impl PresetSet {
     Self {
       freqs: [PRESET_EMPTY; MAX_PRESETS],
       last_tuned: PRESET_EMPTY,
+      pi: [0; MAX_PRESETS],
+      ps: [[0; 8]; MAX_PRESETS],
     }
   }
 
@@ -147,23 +177,107 @@ impl PresetSet {
     self.freqs.iter().position(|&f| f == freq_x10)
   }
 
+  /// Cached PI for slot `idx`, or `None` when the RDS broadcaster
+  /// hasn't been heard yet for that frequency.
+  #[must_use]
+  #[allow(
+    dead_code,
+    reason = "public read-side API; consumed by host-tests \
+                                and future UI surfaces (LCD label) \
+                                that don't go through the web JSON path."
+  )]
+  pub fn pi_for(&self, idx: usize) -> Option<u16> {
+    self.pi.get(idx).copied().filter(|&pi| pi != 0)
+  }
+
+  /// Cached raw PS buffer for slot `idx`, or `None` when unknown.
+  ///
+  /// Returned as the raw 8-byte array; the bytes are ASCII / Latin-1
+  /// with `0x20` padding (i.e. the wire format from RDS Group 0A).
+  /// Callers that want a printable label should strip trailing
+  /// whitespace and run a UTF-8 lossy conversion.
+  #[must_use]
+  #[allow(
+    dead_code,
+    reason = "public read-side API; consumed by host-tests \
+                                and future UI surfaces (LCD label) \
+                                that don't go through the web JSON path."
+  )]
+  pub fn ps_for(&self, idx: usize) -> Option<&[u8; 8]> {
+    self.ps.get(idx).filter(|buf| buf.iter().any(|&b| b != 0))
+  }
+
   /// Insert `freq_x10` into the next free slot, returning that index.
   ///
   /// If the frequency is already saved, returns its existing index.
   /// If all slots are full, the first slot is overwritten (FIFO).
+  ///
+  /// Metadata for newly-claimed slots starts blank; use
+  /// [`Self::set_meta`] (or [`Self::save_with_meta`]) to populate
+  /// PI / PS once RDS reports them.
   pub fn save(&mut self, freq_x10: u16) -> usize {
     if let Some(idx) = self.position(freq_x10) {
       return idx;
     }
     if let Some(idx) = self.freqs.iter().position(|&f| f == PRESET_EMPTY) {
       self.freqs[idx] = freq_x10;
+      // No metadata yet — keep sentinels.
+      self.pi[idx] = 0;
+      self.ps[idx] = [0; 8];
       return idx;
     }
-    // FIFO eviction: shift left, append.
+    // FIFO eviction: shift left, append. Metadata follows the freqs
+    // so the cached PI/PS for the evicted slot 0 is dropped together
+    // with the frequency.
     self.freqs.copy_within(1.., 0);
+    self.pi.copy_within(1.., 0);
+    self.ps.copy_within(1.., 0);
     let last = MAX_PRESETS - 1;
     self.freqs[last] = freq_x10;
+    self.pi[last] = 0;
+    self.ps[last] = [0; 8];
     last
+  }
+
+  /// Save `freq_x10` and seed its RDS metadata in one shot.
+  ///
+  /// Convenience around [`Self::save`] + [`Self::set_meta`] for the
+  /// case where the listener taps "Save" while RDS is already locked
+  /// — we capture the station identity atomically rather than
+  /// waiting for the background watcher to fill it in.
+  ///
+  /// Pass `None` for either field to leave the corresponding cache
+  /// untouched (useful when only PI is known but PS hasn't scrolled
+  /// past yet, or vice-versa).
+  pub fn save_with_meta(&mut self, freq_x10: u16, pi: Option<u16>, ps: Option<[u8; 8]>) -> usize {
+    let idx = self.save(freq_x10);
+    self.set_meta(idx, pi, ps);
+    idx
+  }
+
+  /// Update the cached PI / PS for an existing slot.
+  ///
+  /// Called by the background "fill RDS metadata" loop after the
+  /// listener has tuned to a saved preset for long enough to decode
+  /// PI and a full PS name. `None` arguments leave the existing
+  /// cache entry alone — important because PI typically locks
+  /// within ~1 s while a complete PS name can take 5–10 s, and we
+  /// don't want the early call (PI only) to wipe the PS cache from
+  /// a previous session.
+  ///
+  /// No-op when `idx` is out of range so callers don't need to
+  /// double-check after a `position()` lookup that may have changed
+  /// under FIFO eviction.
+  pub fn set_meta(&mut self, idx: usize, pi: Option<u16>, ps: Option<[u8; 8]>) {
+    if idx >= MAX_PRESETS {
+      return;
+    }
+    if let Some(pi) = pi {
+      self.pi[idx] = pi;
+    }
+    if let Some(ps) = ps {
+      self.ps[idx] = ps;
+    }
   }
 
   /// Return the next saved frequency after `current` (wrap-around).
