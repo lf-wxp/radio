@@ -26,6 +26,7 @@ use picoserve::routing::{get, post};
 use picoserve::{AppBuilder, AppRouter, Router};
 use serde::{Deserialize, Serialize};
 
+use crate::diagnostics::{self, HealthDto};
 use crate::state::{INPUT_CMDS, PRESET_EMPTY, RADIO_STATE, RadioCommand, publish_web_ip};
 
 // ============================================================================
@@ -154,6 +155,7 @@ impl AppBuilder for AppProps {
       .route("/api/preset/cycle", post(handle_post_preset_cycle))
       .route("/api/preset/save", post(handle_post_preset_save))
       .route("/api/mute", post(handle_post_mute))
+      .route("/api/health", get(handle_get_health))
   }
 }
 
@@ -271,6 +273,42 @@ async fn handle_post_mute() {
 // ============================================================================
 // Helpers
 // ============================================================================
+
+/// `GET /api/health` — return a JSON health snapshot for remote diagnostics.
+///
+/// Includes uptime, heap usage, I²C error count, WiFi status, RSSI, and
+/// the POST result. Designed for monitoring dashboards and quick
+/// troubleshooting without physical access to the device.
+async fn handle_get_health() -> picoserve::response::Json<HealthDto> {
+  let post = diagnostics::get_post_result();
+  let dto = if let Some(post_ref) = post {
+    HealthDto::capture(post_ref).await
+  } else {
+    // POST hasn't completed yet (shouldn't happen in practice since
+    // the web task starts after POST, but handle gracefully).
+    let free = diagnostics::heap_free_bytes();
+    let total = diagnostics::heap_total_bytes();
+    let usage_pct = if total > 0 {
+      ((total - free) * 100 / total) as u8
+    } else {
+      0
+    };
+    HealthDto {
+      uptime_secs: diagnostics::uptime_secs(),
+      heap_free: free,
+      heap_total: total,
+      heap_usage_pct: usage_pct,
+      i2c_errors: diagnostics::i2c_error_total(),
+      wifi_connected: false,
+      rssi: 0,
+      tuner_ok: false,
+      post_status: "pending",
+      radio_task_alive: diagnostics::watchdog_ok(),
+      watchdog_elapsed_secs: diagnostics::watchdog_elapsed_secs(),
+    }
+  };
+  picoserve::response::Json(dto)
+}
 
 /// Push a command through the shared input channel.
 ///

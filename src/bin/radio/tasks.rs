@@ -453,6 +453,7 @@ pub async fn radio_control_task(
     .await
     {
       Either::First(command) => {
+        crate::diagnostics::watchdog_feed();
         handle_command(
           &mut radio_chip,
           &mut i2c,
@@ -465,6 +466,7 @@ pub async fn radio_control_task(
         .await;
       }
       Either::Second(_) => {
+        crate::diagnostics::watchdog_feed();
         let probe_armed = {
           let mut ctx = RefreshContext {
             rds: &mut rds,
@@ -709,6 +711,7 @@ async fn refresh_status(
     }
     Err(_) => {
       *ctx.i2c_error_count = ctx.i2c_error_count.saturating_add(1);
+      crate::diagnostics::increment_i2c_errors();
       if *ctx.i2c_error_count >= 10 {
         info!("I2C: {} consecutive read failures", *ctx.i2c_error_count);
         let mut s = RADIO_STATE.lock().await;

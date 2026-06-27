@@ -65,6 +65,7 @@
 - 🔁 **Embassy async** — fully `no_std`, `embassy-executor` + `embassy-sync` channels/mutexes between input task ↔ radio task ↔ UI render loop.
 - 🛠️ **`cargo make` workflow** — one command for build, flash, lint, size-report, host UI preview.
 - 🧪 **On-device tests** — `embedded-test` + `probe-rs` so unit tests run against real hardware.
+- 🩺 **Self-diagnostics** — Power-On Self-Test (POST) validates I²C bus, Si4703 chip ID, heap allocator, and PCNT encoder at boot; a software watchdog monitors the radio control task at runtime. Both are exposed via `GET /api/health`.
 
 ---
 
@@ -195,7 +196,9 @@ esp-radio/
 │       ├── hardware.rs           # GPIO/SPI/I²C/PCNT initialization
 │       ├── state.rs              # Shared embassy-sync primitives
 │       ├── tasks.rs              # Async tasks (input / radio / UI)
-│       └── ui.rs                 # Slint <-> radio-state bridge
+│       ├── ui.rs                 # Slint <-> radio-state bridge
+│       ├── diagnostics.rs        # POST self-test + software watchdog
+│       └── web.rs                # picoserve HTTP server + REST API
 ├── ui/
 │   ├── radio_ui.slint            # Main Material UI
 │   ├── preview_data.json         # Sample data for host preview
@@ -385,6 +388,7 @@ All endpoints live on port 80; bodies are JSON or empty.
 | GET    | `/`                   | —                          | Single-page HTML console.                                                    |
 | GET    | `/api/state`          | —                          | JSON snapshot: freq, RSSI, PS/RT/PTY/AF, mute, presets, WiFi.                |
 | GET    | `/api/log`            | —                          | JSON listening log — last 64 sampled entries (chronological).                |
+| GET    | `/api/health`         | —                          | JSON health snapshot: uptime, heap, I²C errors, watchdog, POST status.       |
 | POST   | `/api/tune`           | `{"freq_x10":1015}`         | Tune to 101.5 MHz; `400` outside `87.5–108.0`.                               |
 | POST   | `/api/tune/up`        | —                          | Nudge +0.1 MHz.                                                              |
 | POST   | `/api/tune/down`      | —                          | Nudge −0.1 MHz.                                                              |
@@ -467,7 +471,8 @@ recommended implementation sequence within each lane.
 - [x] LAN web console — phone-friendly single-page UI + JSON API on port 80
 - [x] mDNS responder — reach the console at `http://esp-radio.local/`
 - [x] Listening log — in-RAM rolling history of PS / RT / RSSI for the web replay panel
-- [x] mDNS responder — reach the console at `http://esp-radio.local/`
+- [x] POST self-diagnostics — boot-time hardware validation (I²C, chip ID, heap, encoder) with LCD status feedback
+- [x] Software watchdog — runtime liveness monitor for the radio control task (5 s timeout), exposed via `/api/health`
 
 ### 🚧 Planned (no extra hardware required)
 

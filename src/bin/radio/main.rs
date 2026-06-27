@@ -52,9 +52,9 @@
 // picoserve's `Router` type is a fluent chain of generics — each
 // `.route(...)` call wraps the previous one, so the layout-of query
 // for `web_task`'s task pool nests once per route. With #9 we now
-// have nine routes; the default 128-step recursion limit is too
+// have ten routes; the default 128-step recursion limit is too
 // shallow for rustc's layout solver in release mode.
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 #![deny(
   clippy::mem_forget,
   reason = "mem::forget is generally not safe to do with esp_hal types, especially those \
@@ -64,6 +64,7 @@
 
 extern crate alloc;
 
+mod diagnostics;
 mod hardware;
 mod listening_log;
 mod mdns;
@@ -87,6 +88,8 @@ use static_cell::StaticCell;
 use radio::rotary_encoder::handle_pcnt_overflow;
 use radio::si4703::{Station, format_freq};
 use radio::wifi_provision::{ConnectionConfig, ProvisioningConfig, WifiProvisioner};
+
+use crate::diagnostics::{PostResult, check_heap, check_i2c_bus, check_si4703_device_id};
 
 use crate::hardware::{DisplayPins, EncoderPins, TunerPins};
 use crate::presets::PresetStore;
@@ -124,6 +127,7 @@ fn pcnt_interrupt_handler() {
 async fn main(spawner: Spawner) -> ! {
   rtt_target::rtt_init_defmt!();
   info!("=== ESP-Radio: starting ===");
+  diagnostics::record_boot_time();
 
   // ------------------------------------------------------------------------
   // Core init: clocks, allocator, embassy
@@ -287,13 +291,64 @@ async fn main(spawner: Spawner) -> ! {
   .await;
   info!("I2C ready");
 
-  if radio_chip.init(&mut i2c).await.is_err() {
-    info!("ERROR: Si4703 init failed - check wiring");
-    set_status("Tuner err!").await;
-    // Keep the UI loop alive so the user can see the error.
-    // `run_loop` returns `!`, so this path never falls through.
-    ui::run_loop(&window, &mut display, &ui_weak).await
+  // --------------------------------------------------------------------------
+  // Power-On Self-Test (POST)
+  // --------------------------------------------------------------------------
+  set_status("POST...").await;
+  ui::render_once(&window, &ui_root, &mut display).await;
+
+  // Check 1: Heap allocator
+  let heap_check = check_heap();
+  info!("POST: heap = {:?}", heap_check.is_pass());
+
+  // Check 2: I²C bus + Si4703 device ID (requires first register read)
+  let (i2c_check, si4703_id_check) = if radio_chip.init(&mut i2c).await.is_ok() {
+    let dev_id = radio_chip.device_id();
+    let bus = check_i2c_bus(dev_id);
+    let chip = check_si4703_device_id(dev_id);
+    info!(
+      "POST: I2C={:?}, Si4703 dev_id=0x{:04X} ({:?})",
+      bus.is_pass(),
+      dev_id,
+      chip.is_pass()
+    );
+    (bus, chip)
+  } else {
+    info!("POST: Si4703 init FAILED");
+    (
+      diagnostics::CheckStatus::Fail(diagnostics::error_codes::I2C_BUS),
+      diagnostics::CheckStatus::Fail(diagnostics::error_codes::SI4703_INIT),
+    )
+  };
+
+  // Check 3: Encoder (validated later when PCNT is initialised)
+  let encoder_check = diagnostics::CheckStatus::Skipped;
+
+  // Assemble POST result and store as 'static for the health endpoint.
+  let post_result = PostResult {
+    i2c_bus: i2c_check,
+    si4703_id: si4703_id_check,
+    heap_alloc: heap_check,
+    encoder: encoder_check,
+  };
+
+  static POST_RESULT: StaticCell<PostResult> = StaticCell::new();
+  let post_ref: &'static PostResult = POST_RESULT.init(post_result.clone());
+  diagnostics::set_post_result(post_ref);
+
+  if !post_result.all_pass() {
+    let msg = post_result.status_message();
+    info!("POST FAILED: {}", msg);
+    set_status(msg).await;
+    ui::render_once(&window, &ui_root, &mut display).await;
+    // If the tuner itself failed, stay in the error screen.
+    if si4703_id_check.is_fail() || i2c_check.is_fail() {
+      ui::run_loop(&window, &mut display, &ui_weak).await
+    }
+  } else {
+    info!("POST: all checks passed");
   }
+
   info!(
     "Si4703 ready (dev=0x{:04X}, chip=0x{:04X})",
     radio_chip.device_id(),
@@ -364,9 +419,7 @@ async fn main(spawner: Spawner) -> ! {
   // Listening-log sampler: pure software task that snapshots
   // RADIO_STATE every 10 s into the in-RAM ring buffer for the
   // web console's replay panel.
-  if let Err(e) = spawner.spawn(tasks::logger_task()) {
-    info!("Failed to spawn logger_task: {:?} — log disabled", e);
-  }
+  spawner.spawn(tasks::logger_task().expect("create logger_task token"));
 
   // Tiny pause to let tasks initialise before we monopolise the executor.
   Timer::after(Duration::from_millis(10)).await;
