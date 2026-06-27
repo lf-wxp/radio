@@ -1,7 +1,7 @@
 
 # OTA Firmware Update — Technical Design
 
-> Status: **Phase 1 in progress** — partition table + flash hand-off shipped
+> Status: **Phase 1 + 2a in progress** — partition table, flash hand-off, sector-buffered writer landed
 > Author: esp-radio maintainers
 > Last updated: 2026-06-27
 > Tracking: Roadmap item *"OTA firmware update via HTTP/HTTPS"*
@@ -177,20 +177,57 @@ proposal and keeps the steady-state lock-free.
 
 ## 5. Public API Sketch
 
+### 5.1 Writer (landed 2026-06-27, #11-2a)
+
 ```rust
-// src/ota/mod.rs
-pub struct OtaUpdater<'a> {
-    flash: &'a Mutex<NoopRawMutex, FlashStorage>,
-    pt:    PartitionTable<'static>,
-}
+// src/bin/radio/ota/writer.rs
+pub struct OtaWriter<'d> { /* opaque */ }
 
-#[derive(defmt::Format)]
+#[derive(defmt::Format, Clone, Copy, PartialEq, Eq)]
 pub enum OtaError {
-    Connect, Http(u16), Truncated, BadMagic,
-    AppDescMismatch { found: heapless::String<32> },
-    Flash, NoFreeSlot,
+    ImageTooLarge { image_size: u32, slot_size: u32 },
+    SizeMismatch  { expected: u32, received: u32 },
+    SlotNotFound,
+    Flash(esp_storage::FlashStorageError),
+    Partition(esp_bootloader_esp_idf::partitions::Error),
 }
 
+impl<'d> OtaWriter<'d> {
+    pub fn begin(
+        flash: FlashStorage<'d>,
+        expected_size: Option<u32>,
+    ) -> Result<Self, OtaError>;
+    pub async fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), OtaError>;
+    pub fn bytes_written(&self) -> u32;
+    pub fn progress_percent(&self) -> Option<u8>;
+    pub fn finalize(self) -> Result<FlashStorage<'d>, OtaError>;
+    pub fn abort(self) -> FlashStorage<'d>;
+}
+```
+
+**Buffering strategy.** `esp-storage::FlashStorage` exposes two trait
+impls: `embedded_storage::Storage::write` does read-modify-erase-write
+on *every* call (one full 4 KiB cycle even for a 16-byte payload),
+while `embedded_storage::nor_flash::NorFlash::{erase,write}` are raw
+but respect alignment. Caller chunks (HTTP packets) arrive at
+unpredictable boundaries, so `OtaWriter` accumulates them in a 4 KiB
+heap-allocated sector buffer and flushes only when full (or on
+`finalize`). This keeps flash wear and programming time at the
+theoretical minimum: exactly one erase + one program per sector,
+~30–50 ms each. A 1.5 MiB image flushes ~384 sectors → 12–20 s
+wall-clock, with a `Timer::after_micros(0)` yield between sectors so
+the embassy executor can keep WiFi / WDT alive.
+
+**Memory budget.** Both 3 KiB partition-table buffers and the 4 KiB
+sector accumulator live on the heap — the crate-wide
+`deny(clippy::large_stack_frames)` would otherwise reject any 1 KiB+
+stack frame. Peak heap usage during OTA: ~7 KiB (sector buffer +
+short-lived PT buffers in `begin`/`finalize`).
+
+### 5.2 Downloader / progress (#11-3, pending)
+
+```rust
+// src/bin/radio/ota/http.rs (planned)
 #[derive(defmt::Format, Clone, Copy)]
 pub enum OtaProgress {
     Connecting,
@@ -201,14 +238,12 @@ pub enum OtaProgress {
     Failed(OtaError),
 }
 
-impl<'a> OtaUpdater<'a> {
-    pub async fn run(
-        &mut self,
-        stack: &Stack<'_>,
-        url: &str,
-        progress: &Channel<NoopRawMutex, OtaProgress, 4>,
-    ) -> Result<(), OtaError> { /* … */ }
-}
+pub async fn run_http_ota(
+    stack: &Stack<'_>,
+    url: &str,
+    flash: FlashStorage<'_>,
+    progress: &Channel<NoopRawMutex, OtaProgress, 4>,
+) -> Result<FlashStorage<'_>, OtaError>;
 ```
 
 `RadioCommand::StartOta(heapless::String<256>)` is added to the existing
@@ -284,7 +319,7 @@ command channel; the response funnels into `RadioState.ota_progress`.
 | -- | ----------------------------------------------------------------------------- | -------- | -------- |
 | 1  | Add `partitions.csv` + flash hand-off (`pause`/`resume`) + state interlock    | 4        | ✅ done  |
 | 2  | Skipped — `esp-bootloader-esp-idf` already provides `Ota` / `OtaUpdater`      | 0        | n/a      |
-| 3  | New `src/ota/writer.rs` thin wrapper over `OtaUpdater::next_partition`        | 2        | pending  |
+| 3  | New `src/bin/radio/ota/writer.rs` — sector-buffered NOR writer + activate | 2        | ✅ done  |
 | 4  | New `src/ota/http.rs` — reqwless wrapper, header parsing, retry policy        | 6        | pending  |
 | 5  | New `src/ota/verify.rs` — SHA-256 check + `esp_app_desc` sanity               | 3        | pending  |
 | 6  | Hook `RadioCommand::StartOta` into `tasks.rs`, progress channel               | 3        | pending  |
@@ -328,3 +363,18 @@ command channel; the response funnels into `RadioState.ota_progress`.
   - Documented that existing devices keep their Wi-Fi credentials
     across the partition-table change (the credential sector at
     `0x3F_F000` already falls inside the new `storage` partition).
+- **2026-06-27** — Phase 2a landed (#11-2a):
+  - Added `src/bin/radio/ota/writer.rs` (`OtaWriter` + `OtaError`,
+    ~250 LoC). Streaming writer that buffers caller bytes into a 4 KiB
+    heap-allocated sector accumulator and flushes one
+    erase-then-program per sector via
+    `embedded_storage::nor_flash::NorFlash`.
+  - Re-uses `esp-bootloader-esp-idf::ota_updater::OtaUpdater::next_partition`
+    in `begin` (to discover the inactive slot) and
+    `activate_next_partition` + `set_current_ota_state(New)` in
+    `finalize` (to atomically flip OTA-data).
+  - All scratch buffers (3 KiB PT × 2, 4 KiB sector) live on the heap
+    to satisfy the crate-wide `deny(clippy::large_stack_frames)`.
+  - Module is wired into `main.rs` with `#[expect(dead_code)]` until
+    #11-3 (HTTP downloader) consumes it; `cargo make ci` and
+    `cargo build --bin radio --release` both pass.

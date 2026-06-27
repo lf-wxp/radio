@@ -68,6 +68,12 @@ mod diagnostics;
 mod hardware;
 mod listening_log;
 mod mdns;
+#[expect(
+  dead_code,
+  reason = "OtaWriter is plumbed in #11-3 (HTTP downloader); landed early so the partition-table \
+    + flash-handover decisions ship with #11-2."
+)]
+mod ota;
 mod presets;
 mod state;
 mod tasks;

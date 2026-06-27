@@ -1,7 +1,7 @@
 
 # OTA 固件升级 — 技术设计
 
-> 状态：**一期进行中** —— 分区表 + flash 交接机制已交付
+> 状态：**一期 + 二期a 进行中** —— 分区表、flash 交接、按扇区缓冲的 writer 已交付
 > 作者：esp-radio 维护者
 > 最近更新：2026-06-27
 > 跟踪：Roadmap 条目 *"通过 HTTP/HTTPS 实现 OTA 固件升级"*
@@ -164,20 +164,43 @@ impl PausedPresetStore {
 
 ## 5. 公共 API 草图
 
+### 5.1 Writer（2026-06-27 交付，#11-2a）
+
 ```rust
-// src/ota/mod.rs
-pub struct OtaUpdater<'a> {
-    flash: &'a Mutex<NoopRawMutex, FlashStorage>,
-    pt:    PartitionTable<'static>,
-}
+// src/bin/radio/ota/writer.rs
+pub struct OtaWriter<'d> { /* opaque */ }
 
-#[derive(defmt::Format)]
+#[derive(defmt::Format, Clone, Copy, PartialEq, Eq)]
 pub enum OtaError {
-    Connect, Http(u16), Truncated, BadMagic,
-    AppDescMismatch { found: heapless::String<32> },
-    Flash, NoFreeSlot,
+    ImageTooLarge { image_size: u32, slot_size: u32 },
+    SizeMismatch  { expected: u32, received: u32 },
+    SlotNotFound,
+    Flash(esp_storage::FlashStorageError),
+    Partition(esp_bootloader_esp_idf::partitions::Error),
 }
 
+impl<'d> OtaWriter<'d> {
+    pub fn begin(
+        flash: FlashStorage<'d>,
+        expected_size: Option<u32>,
+    ) -> Result<Self, OtaError>;
+    pub async fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), OtaError>;
+    pub fn bytes_written(&self) -> u32;
+    pub fn progress_percent(&self) -> Option<u8>;
+    pub fn finalize(self) -> Result<FlashStorage<'d>, OtaError>;
+    pub fn abort(self) -> FlashStorage<'d>;
+}
+```
+
+**缓冲策略**。`esp-storage::FlashStorage` 实现了两套 trait：
+`embedded_storage::Storage::write` 每次调用都走 read-modify-erase-write（哪怕只写 16 字节，也会走一轮完整的 4 KiB 周期）；`embedded_storage::nor_flash::NorFlash::{erase,write}` 则是原始接口，但要求对齐。调用方传入的块（HTTP 报文）边界不可预测，所以 `OtaWriter` 在内部累加到一个堆上的 4 KiB 扇区缓冲区，只有在装满（或在 `finalize` 时）才 flush。这使 flash 损耗与编程时间达到理论最小值：每扇区恫好一次 erase + 一次 program，~30–50 ms。以 1.5 MiB 镜像计 ≈ 384 个扇区 → 12–20 s 压轴时间，每扇区间 `Timer::after_micros(0)` 让出以供 WiFi / WDT 调度。
+
+**内存预算**。两个 3 KiB 分区表临时 buffer 以及 4 KiB 扇区缓冲区均位于堆上 —— crate 级别 `deny(clippy::large_stack_frames)` 会拒绝任何占 1 KiB 以上栈的帧。一次 OTA 峰值堆占用约 7 KiB（4 KiB sector 常骐 + 短生命周期的 PT buffer）。
+
+### 5.2 下载器 / 进度（#11-3，待做）
+
+```rust
+// src/bin/radio/ota/http.rs（计划中）
 #[derive(defmt::Format, Clone, Copy)]
 pub enum OtaProgress {
     Connecting,
@@ -188,18 +211,15 @@ pub enum OtaProgress {
     Failed(OtaError),
 }
 
-impl<'a> OtaUpdater<'a> {
-    pub async fn run(
-        &mut self,
-        stack: &Stack<'_>,
-        url: &str,
-        progress: &Channel<NoopRawMutex, OtaProgress, 4>,
-    ) -> Result<(), OtaError> { /* … */ }
-}
+pub async fn run_http_ota(
+    stack: &Stack<'_>,
+    url: &str,
+    flash: FlashStorage<'_>,
+    progress: &Channel<NoopRawMutex, OtaProgress, 4>,
+) -> Result<FlashStorage<'_>, OtaError>;
 ```
 
-`RadioCommand::StartOta(heapless::String<256>)` 加入现有命令通道；
-反向进度写回 `RadioState.ota_progress`。
+`RadioCommand::StartOta(heapless::String<256>)` 加入现有命令通道；反向进度写回 `RadioState.ota_progress`。
 
 ---
 
@@ -262,7 +282,7 @@ impl<'a> OtaUpdater<'a> {
 | ---- | -------------------------------------------------------------------------- | -------- | ---- |
 | 1    | 新增 `partitions.csv` + flash “pause/resume” 交接 + state 互锁              | 4        | ✅ 完成 |
 | 2    | 跳过 —— `esp-bootloader-esp-idf` 已提供 `Ota` / `OtaUpdater`            | 0        | 不适用 |
-| 3    | `src/ota/writer.rs`：在 `OtaUpdater::next_partition` 上加薄包装             | 2        | 待做 |
+| 3    | `src/bin/radio/ota/writer.rs`：按扇区缓冲的 NOR 写入 + 激活切槽                | 2        | ✅ 完成 |
 | 4    | `src/ota/http.rs`：reqwless 包装、Header 解析、重试策略                   | 6        | 待做 |
 | 5    | `src/ota/verify.rs`：SHA-256 校验 + `esp_app_desc` 完整性检查            | 3        | 待做 |
 | 6    | 在 `tasks.rs` 接入 `RadioCommand::StartOta`，进度通道贯通                  | 3        | 待做 |
@@ -302,3 +322,19 @@ impl<'a> OtaUpdater<'a> {
     写 `src/ota/writer.rs`，二期工作量从 4 小时压缩到2 小时。
   - 明确存量设备在分区表更换后仍保留 Wi-Fi 凭据（凭据 sector
     位于 `0x3F_F000`，恰在新 `storage` 分区内）。
+- **2026-06-27** — 二期a 交付（#11-2a）：
+  - 新增 `src/bin/radio/ota/writer.rs`（`OtaWriter` + `OtaError`，
+    ~250 行）。流式写入器，将调用方字节累加到堆上 4 KiB
+    扇区缓冲区，通过 `embedded_storage::nor_flash::NorFlash`
+    按扇区一次 erase + 一次 program 刷入。
+  - `begin` 复用
+    `esp-bootloader-esp-idf::ota_updater::OtaUpdater::next_partition`
+    发现非活动槽；`finalize` 调
+    `activate_next_partition` + `set_current_ota_state(New)`
+    原子翻转 OTA-data。
+  - 所有划划区 buffer（3 KiB PT × 2、
+    4 KiB sector）均走堆，满足 crate 级的
+    `deny(clippy::large_stack_frames)`。
+  - 模块以 `#[expect(dead_code)]` 接入 `main.rs`，等待
+    #11-3（HTTP 下载器）消费；`cargo make ci` 与
+    `cargo build --bin radio --release` 均通过。

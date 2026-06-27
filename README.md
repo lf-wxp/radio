@@ -491,7 +491,7 @@ working days.
 | 7   | LAN web console via `picoserve` (`/api/state`, `/api/tune`) | 2 d    | Tiny single-page HTML + JSON API; phone becomes a remote.                            |
 | ✅  | mDNS broadcast `esp-radio.local`                            | 1 d    | Passive A-record responder on `224.0.0.251:5353`; pairs with #7 so the user can browse `http://esp-radio.local/`. Shipped 2026-06. |
 | ✅  | RDS listening log (rolling buffer of PS/RT/RSSI)            | 1 d    | 64-entry in-RAM ring buffer sampled every 10 s; rendered by the web console under "Listening log". Flash persistence intentionally deferred to keep #11's flash budget. Shipped 2026-06. |
-| 11  | OTA firmware update                                         | 3 d    | Phase 1 ✅ (partition table + flash hand-off shipped 2026-06); HTTP downloader / verifier / UI overlay still pending. Reduced from 5 d once we decided to reuse `esp-bootloader-esp-idf::OtaUpdater`. Tracking in [docs/ota-design.md](./docs/ota-design.md). |
+| 11  | OTA firmware update                                         | 3 d    | Phase 1 ✅ (partition table + flash hand-off shipped 2026-06); Phase 2a ✅ (sector-buffered `OtaWriter` shipped 2026-06); HTTP downloader / verifier / UI overlay still pending. Reduced from 5 d once we decided to reuse `esp-bootloader-esp-idf::OtaUpdater`. Tracking in [docs/ota-design.md](./docs/ota-design.md). |
 
 ### 🚫 Out of scope on current hardware
 
