@@ -210,14 +210,35 @@ BINDGEN_EXTRA_CLANG_ARGS = {script = [
 MACOSX_DEPLOYMENT_TARGET = "14.0"
 
 [tasks.ui-preview-data]
-description = "Live-preview the radio UI with sample data (RDS / volume / signal)"
+description = """
+Live-preview the radio UI with sample data. Pick a scenario via SCENARIO env:
+  SCENARIO=default            ui/preview_data.json (saturated normal listen)
+  SCENARIO=boot               ui/preview_data.boot.json (no WiFi/RDS, muted)
+  SCENARIO=weak_mono          ui/preview_data.weak_mono.json (weak signal, MO*)
+  SCENARIO=ota_downloading    ui/preview_data.ota_downloading.json
+  SCENARIO=ota_indeterminate  ui/preview_data.ota_indeterminate.json
+  SCENARIO=ota_success        ui/preview_data.ota_success.json
+  SCENARIO=ota_failed         ui/preview_data.ota_failed.json
+Or use the convenience aliases ui-preview-boot / ui-preview-weak / ui-preview-ota[-success|-failed|-indeterminate].
+"""
 install_crate = {crate_name = "slint-viewer", binary = "slint-viewer", test_arg = "--version"}
-command = "slint-viewer"
-args = [
-  "-I", "material-1.0",
-  "--auto-reload",
-  "--load-data", "ui/preview_data.json",
-  "ui/radio_ui.slint",
+script_runner = "@shell"
+script = [
+  '''
+  s="${SCENARIO:-default}"
+  if [ "$s" = "default" ]; then
+    data="ui/preview_data.json"
+  else
+    data="ui/preview_data.$s.json"
+  fi
+  if [ ! -f "$data" ]; then
+    echo "ui-preview-data: scenario file not found: $data" >&2
+    echo "Available scenarios: default boot weak_mono ota_downloading ota_indeterminate ota_success ota_failed" >&2
+    exit 2
+  fi
+  echo "ui-preview-data: scenario=$s -> $data"
+  exec slint-viewer -I material-1.0 --auto-reload --load-data "$data" ui/radio_ui.slint
+  '''
 ]
 
 [tasks.ui-preview-data.env]
@@ -226,6 +247,38 @@ BINDGEN_EXTRA_CLANG_ARGS = {script = [
   "sdk=$(xcrun --show-sdk-path 2>/dev/null); if [ -n \"$sdk\" ]; then echo \"-isysroot $sdk -target $(uname -m)-apple-darwin\"; else echo; fi",
 ]}
 MACOSX_DEPLOYMENT_TARGET = "14.0"
+
+# ----- Convenience aliases for ui-preview-data scenarios -----
+
+[tasks.ui-preview-boot]
+description = "Live-preview the radio UI in boot/initial state (no WiFi, no RDS, muted)"
+extend = "ui-preview-data"
+env = {SCENARIO = "boot"}
+
+[tasks.ui-preview-weak]
+description = "Live-preview the radio UI on a weak station (forced mono, AF probing, no IP yet)"
+extend = "ui-preview-data"
+env = {SCENARIO = "weak_mono"}
+
+[tasks.ui-preview-ota]
+description = "Live-preview the OTA overlay mid-download (determinate progress)"
+extend = "ui-preview-data"
+env = {SCENARIO = "ota_downloading"}
+
+[tasks.ui-preview-ota-indeterminate]
+description = "Live-preview the OTA overlay with unknown total size (spinner)"
+extend = "ui-preview-data"
+env = {SCENARIO = "ota_indeterminate"}
+
+[tasks.ui-preview-ota-success]
+description = "Live-preview the OTA overlay in the success terminal state"
+extend = "ui-preview-data"
+env = {SCENARIO = "ota_success"}
+
+[tasks.ui-preview-ota-failed]
+description = "Live-preview the OTA overlay in the failed terminal state"
+extend = "ui-preview-data"
+env = {SCENARIO = "ota_failed"}
 
 # ============================================================
 # OTA developer workflow (host-side, no ESP32 hardware needed for ota-serve)
