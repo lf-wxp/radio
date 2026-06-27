@@ -3,6 +3,11 @@
 //! Lets the user reach the LAN web console (see [`crate::web`]) via
 //! `http://esp-radio.local/` instead of memorising a DHCP-assigned IP.
 //!
+//! > **Sync note**: pure-logic functions (`parse_query`, `build_response`,
+//! > `eq_ascii_case_insensitive`) are mirrored in
+//! > `tools/host-tests/src/mdns_parser.rs` so `cargo make host-test`
+//! > can exercise them. Mirror any change there too.
+//!
 //! ## Scope (intentionally small)
 //!
 //! This is a passive, single-name responder \u2014 not a full DNS-SD stack:

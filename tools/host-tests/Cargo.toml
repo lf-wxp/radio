@@ -1,0 +1,20 @@
+[package]
+name = "host-tests"
+version = "0.1.0"
+edition = "2024"
+description = "Host-side unit tests for pure-logic modules of the radio binary"
+publish = false
+
+# Stand-alone crate intentionally NOT part of the parent project workspace:
+# the parent crate is locked to `riscv32imac-unknown-none-elf` via
+# `.cargo/config.toml`, while these tests run on the developer's host.
+[workspace]
+
+[lib]
+name = "host_tests"
+path = "src/lib.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3

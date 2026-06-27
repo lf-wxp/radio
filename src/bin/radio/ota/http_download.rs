@@ -1,6 +1,10 @@
 //! Plain-HTTP downloader that streams a firmware image from a LAN host
 //! into an [`OtaWriter`].
 //!
+//! > **Sync note**: the URL parser (`parse_url`, `parse_ipv4`) is mirrored
+//! > in `tools/host-tests/src/url_parser.rs` so `cargo make host-test`
+//! > can exercise it on the host. Mirror any change there too.
+//!
 //! # Scope
 //!
 //! - **HTTP only** — TLS support is intentionally deferred (see

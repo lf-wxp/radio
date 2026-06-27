@@ -267,8 +267,9 @@ cargo make flash-example -e EXAMPLE=si4703_fm_radio
 | `fmt-check`                 | Verify formatting without modifying files                        |
 | `size` / `size-example`     | Print release-mode firmware size with `rust-size`                |
 | `test`                      | Run on-device tests (`embedded-test` + `probe-rs`)               |
+| `host-test`                 | Run host-side unit tests for pure-logic mirrors (no hardware)    |
 | `clean`                     | `cargo clean`                                                    |
-| `ci`                        | `fmt-check` + `clippy` + `build-all-release`                     |
+| `ci`                        | `fmt-check` + `clippy` + `host-test` + `build-all-release`       |
 | `dev`                       | Fast dev loop: `check` + `clippy`                                |
 | `release`                   | Full release pipeline                                            |
 | `ui-install-viewer`         | Install / verify host-side `slint-viewer`                        |
@@ -336,8 +337,8 @@ Numbers from a `cargo make build-release` on Rust nightly (LTO `fat`, `opt-level
 flowchart LR
     A([edit code]) --> B{cargo make}
     B -->|dev| C[check + clippy]
-    B -->|ci|  D[fmt-check + clippy + build-all-release]
-    B -->|release| E[fmt-check + clippy + build-all-release + size]
+    B -->|ci|  D[fmt-check + clippy + host-test + build-all-release]
+    B -->|release| E[fmt-check + clippy + host-test + build-all-release + size]
     C --> F[flash-release]
     D --> F
     E --> F
@@ -520,7 +521,7 @@ working days.
 | ✅  | Tune acceleration on the rotary encoder                     | 0.25 d | Detent-rate-driven step multiplier (×1/×2/×3/×5) with direction-reversal & idle resets. Shipped 2026-06. |
 | ✅  | Presets + restore last frequency on boot                    | 1.5 d  | `esp-storage` record at partition `storage` (0x3E_0000); short-press cycles saved stations, long-press saves, ultra-long mutes. Shipped 2026-06. |
 | ✅  | RDS-AF alternative-frequency follow                         | 2 d    | Group 0A block C parsed, PI gated; weak-signal probe ( ≤ 18 RSSI for 5 s) auto-hops to the strongest AF and rolls back if PI mismatches. Shipped 2026-06. |
-| 7   | LAN web console via `picoserve` (`/api/state`, `/api/tune`) | 2 d    | Tiny single-page HTML + JSON API; phone becomes a remote.                            |
+| ✅  | LAN web console via `picoserve` (`/api/state`, `/api/tune`) | 2 d    | Mobile-friendly single-page HTML + JSON API on port 80; the LCD shows the access URL once DHCP is up. Ten routes cover state/log/tune/preset-cycle/preset-save/mute/OTA/health. Shipped 2026-06. |
 | ✅  | mDNS broadcast `esp-radio.local`                            | 1 d    | Passive A-record responder on `224.0.0.251:5353`; pairs with #7 so the user can browse `http://esp-radio.local/`. Shipped 2026-06. |
 | ✅  | RDS listening log (rolling buffer of PS/RT/RSSI)            | 1 d    | 64-entry in-RAM ring buffer sampled every 10 s; rendered by the web console under "Listening log". Flash persistence intentionally deferred to keep #11's flash budget. Shipped 2026-06. |
 | ✅  | OTA firmware update                                         | 3 d    | End-to-end shipped 2026-06: GPT partition table, sector-buffered `OtaWriter` (reuses `esp-bootloader-esp-idf::OtaUpdater`), HTTP downloader, ESP image-header verifier, web-console trigger (`POST /api/ota`), and a fullscreen Slint progress overlay on the LCD. `cargo make ota-serve` runs an in-tree Rust dev server with QR code; tracking notes in [docs/ota-design.md](./docs/ota-design.md). |
@@ -555,6 +556,7 @@ on the roadmap:
 
 ### 📑 Design documents
 
+- [Architecture overview](./ARCHITECTURE.md) — runtime topology, task / channel map, boot sequence, flash ownership.
 - [OTA firmware update — technical design](./docs/ota-design.md)
 
 ---

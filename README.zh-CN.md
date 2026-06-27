@@ -267,8 +267,9 @@ cargo make flash-example -e EXAMPLE=si4703_fm_radio
 | `fmt-check`                 | 仅检查格式不修改文件                                          |
 | `size` / `size-example`     | 用 `rust-size` 输出 release 固件大小                          |
 | `test`                      | 设备端测试（`embedded-test` + `probe-rs`）                    |
+| `host-test`                 | 宿主侧纯逻辑单元测试（不依赖硬件）                            |
 | `clean`                     | `cargo clean`                                                 |
-| `ci`                        | `fmt-check` + `clippy` + `build-all-release`                  |
+| `ci`                        | `fmt-check` + `clippy` + `host-test` + `build-all-release`    |
 | `dev`                       | 快速开发循环：`check` + `clippy`                              |
 | `release`                   | 完整发布流水线                                                |
 | `ui-install-viewer`         | 安装 / 校验宿主机的 `slint-viewer`                            |
@@ -336,8 +337,8 @@ cargo make ui-preview-data
 flowchart LR
     A([编辑代码]) --> B{cargo make}
     B -->|dev| C[check + clippy]
-    B -->|ci|  D[fmt-check + clippy + build-all-release]
-    B -->|release| E[fmt-check + clippy + build-all-release + size]
+    B -->|ci|  D[fmt-check + clippy + host-test + build-all-release]
+    B -->|release| E[fmt-check + clippy + host-test + build-all-release + size]
     C --> F[flash-release]
     D --> F
     E --> F
@@ -543,6 +544,7 @@ BLE 射频、Flash。工时为单人投入估算。
 
 ### 📑 设计文档
 
+- [架构总览](./ARCHITECTURE.md) — 运行时拓扑、任务 / 通道图、启动序列、Flash 所有权。
 - [OTA 固件升级 — 技术设计](./docs/ota-design.zh-CN.md)
 
 ---

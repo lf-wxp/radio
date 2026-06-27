@@ -1,5 +1,9 @@
 //! In-memory rolling log of what the listener was tuned to.
 //!
+//! > **Sync note**: `clip_to_buf` is mirrored in
+//! > `tools/host-tests/src/text.rs` so `cargo make host-test` can
+//! > exercise it on the host. Mirror any change there too.
+//!
 //! Roadmap #9. A snapshot of the radio state (frequency / RSSI /
 //! station name / radio text) is appended every
 //! [`SAMPLE_INTERVAL_SECS`] seconds by [`crate::tasks::logger_task`],

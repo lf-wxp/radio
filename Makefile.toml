@@ -42,9 +42,9 @@ command = "cargo"
 args = ["build", "--lib", "--examples"]
 
 [tasks.build-all-release]
-description = "Build library and all examples (release profile)"
+description = "Build library, all examples, and the radio binary (release profile)"
 command = "cargo"
-args = ["build", "--lib", "--examples", "--release"]
+args = ["build", "--lib", "--examples", "--bin", "radio", "--release"]
 
 # ============================================================
 # Flash and run tasks
@@ -125,9 +125,23 @@ args = ["target/${TARGET}/release/examples/${EXAMPLE}"]
 # ============================================================
 
 [tasks.test]
-description = "Run on-device tests"
+description = "Run on-device tests (probe-rs)"
 command = "cargo"
 args = ["test"]
+
+[tasks.host-test]
+description = "Run host-side unit tests for pure-logic mirrors (tools/host-tests)"
+# We set the env variables inside a sub-shell rather than via [tasks.host-test.env]
+# because cargo-make leaks env across subsequent tasks in a `dependencies` chain
+# (the next task `build-all-release` would inherit CARGO_BUILD_TARGET and fail
+# with `esp-hal` build.rs panic). A scoped env in a sub-shell isolates them.
+script_runner = "@shell"
+script = '''
+RUSTUP_TOOLCHAIN=stable \
+CARGO_BUILD_TARGET="$(rustc -vV | sed -n 's/host: //p')" \
+RUSTFLAGS= \
+cargo test --manifest-path tools/host-tests/Cargo.toml
+'''
 
 # ============================================================
 # Monitor tasks
@@ -143,8 +157,8 @@ args = ["attach", "--chip", "${CHIP}", "target/${TARGET}/debug/radio", "--always
 # ============================================================
 
 [tasks.ci]
-description = "CI pipeline: format check + clippy + build"
-dependencies = ["fmt-check", "clippy", "build-all-release"]
+description = "CI pipeline: format check + clippy + host tests + release build"
+dependencies = ["fmt-check", "clippy", "host-test", "build-all-release"]
 
 [tasks.dev]
 description = "Development workflow: check + clippy"
