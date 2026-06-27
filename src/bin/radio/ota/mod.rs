@@ -7,8 +7,10 @@
 //! - [`http_download`] — plain-HTTP downloader that feeds the writer.
 //! - [`run_job`] — top-level state-machine driver invoked by the radio
 //!   control task when an `OtaCommand::Start` arrives.
-//! - [`mark_current_app_valid`] — anti-rollback latch flipped on a
-//!   successful boot so the bootloader doesn't revert on the next reset.
+//! - [`mark_current_app_valid`] — records `OtaImageState::Valid` in
+//!   `otadata` on a successful boot. This is preparatory bookkeeping
+//!   for a future rollback-capable bootloader; the stock bootloader
+//!   shipped by `espflash` does not act on the field today.
 
 pub mod http_download;
 pub mod writer;
@@ -27,17 +29,21 @@ use crate::state::{OtaProgress, publish_ota_in_progress, publish_ota_progress};
 
 pub use writer::{OtaError, OtaWriter};
 
-/// Mark the running app image as `Valid`, defeating bootloader rollback.
+/// Record `OtaImageState::Valid` for the running slot in the
+/// `otadata` sector.
 ///
-/// Call once per successful boot, after the critical subsystems (WiFi,
-/// display, tuner POST) have come up. The bootloader records this in
-/// the OTA-data sector, so the next reboot won't roll back to the
-/// previous slot even if the user power-cycles immediately.
+/// **Status:** preparatory bookkeeping only. The stock bootloader
+/// shipped by `espflash` (current default for this project) does not
+/// honour the OTA image-state field, so calling this does **not**
+/// arm or disarm any rollback today — there is nothing to roll back
+/// to. Wiring it up now means a future bootloader build with
+/// `BOOTLOADER_APP_ROLLBACK_ENABLE` will see a sane state immediately
+/// without an additional firmware revision.
 ///
-/// On chips without `bootloader_app_rollback` enabled this is a no-op
-/// in practice (the bootloader simply ignores the state field). Failing
-/// the call is non-fatal — we log and continue so a corrupt OTA-data
-/// sector doesn't brick the device on every boot.
+/// Call once per successful boot, after the critical subsystems
+/// (WiFi, display, tuner POST) have come up. Failing the call is
+/// non-fatal — we log and continue so a corrupt OTA-data sector
+/// doesn't brick the device on every boot.
 pub fn mark_current_app_valid(flash: &mut FlashStorage<'_>) {
   // 3 KiB partition-table buffer on the heap to keep the stack frame
   // small (the surrounding `main` already lives close to its
@@ -56,7 +62,7 @@ pub fn mark_current_app_valid(flash: &mut FlashStorage<'_>) {
       if let Err(e) = updater.set_current_ota_state(OtaImageState::Valid) {
         warn!("OTA: mark_current_app_valid failed: {:?}", e);
       } else {
-        info!("OTA: current image committed (rollback disarmed)");
+        info!("OTA: current image recorded as Valid in otadata");
       }
     }
     Err(e) => {

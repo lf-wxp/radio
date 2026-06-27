@@ -282,11 +282,13 @@ async fn main(spawner: Spawner) -> ! {
   // sole writer.
   // ------------------------------------------------------------------------
   let mut flash = provisioner.into_flash();
-  // Anti-rollback latch: now that WiFi + display have come up cleanly,
-  // tell the bootloader to commit the running image. Failing this is
-  // non-fatal (older partition layouts without `otadata` simply skip
-  // the write), so we keep the `flash` handle for the preset store
-  // regardless. See `ota::mark_current_app_valid` for the rationale.
+  // Record `OtaImageState::Valid` in `otadata` now that WiFi + display
+  // have come up cleanly. This is preparatory bookkeeping for a future
+  // rollback-capable bootloader build; the stock bootloader shipped by
+  // `espflash` does not act on the field today, so the call is best
+  // effort. Failure is non-fatal (older partition layouts without
+  // `otadata` simply skip the write), so we keep the `flash` handle
+  // for the preset store regardless.
   ota::mark_current_app_valid(&mut flash);
   let preset_store = PresetStore::open(flash);
   let stored_presets = preset_store.snapshot();

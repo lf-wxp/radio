@@ -162,7 +162,7 @@ sequenceDiagram
     Main->>Net: spawn mdns_task (udp/5353)
     Main->>Net: spawn ntp_task (udp/123)
   Main->>WP: into_flash() — return flash to Main
-  Main->>FS: ota::mark_current_app_valid (anti-rollback)
+  Main->>FS: ota::mark_current_app_valid (otadata bookkeeping)
   Main->>PS: open(flash) — flash now owned by PresetStore
   Main->>SI: init + POST + sweep_rssi + tune(initial_freq)
   Main->>SP: spawn input_task(encoder)
@@ -218,7 +218,7 @@ boot ──► Provisioner ──► (into_flash) ──► PresetStore
 | --- | --- | --- |
 | `bootloader` | 32 KiB | esp-bootloader-esp-idf |
 | `partitions` | 4 KiB | partition table (`partitions.csv`) |
-| `otadata` | 8 KiB | active-slot pointer, anti-rollback |
+| `otadata` | 8 KiB | active-slot pointer + image-state field (latter unused by stock bootloader) |
 | `ota_0`, `ota_1` | 1.875 MiB each | A/B firmware slots |
 | `storage` | 64 KiB | presets + last-tuned + WiFi creds (last sector) |
 | `nvs` | residual | esp-radio reserves; not used by app |

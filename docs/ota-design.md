@@ -19,8 +19,11 @@ investigation.
 - Allow the device to fetch a new application image from a configurable
   HTTP(S) URL and boot into it on the next reset.
 - Provide UI feedback (progress %, success/failure) during the update.
-- Support **safe rollback**: if the new image fails to mark itself valid
-  within N boots, the bootloader reverts to the previous slot automatically.
+- Be **rollback-ready**: record the OTA image state in `otadata` so a
+  future bootloader build with `BOOTLOADER_APP_ROLLBACK_ENABLE` can act
+  on it without an additional firmware revision. (The stock bootloader
+  shipped by `espflash` ignores the field today, so this is preparatory
+  bookkeeping only — there is no automatic revert at this layer.)
 - Be triggerable from the existing input devices (rotary-encoder long
   press) **and** from a future companion app via Wi-Fi.
 
@@ -269,10 +272,15 @@ command channel; the response funnels into `RadioState.ota_progress`.
 ## 7. Risks & Mitigations
 
 ### 7.1 Bricked device on bad image
-- **Risk:** new image hangs early → no `mark_app_valid_cancel_rollback`.
-- **Mitigation:** rely on `esp-bootloader-esp-idf` rollback; require the
-  application to call `Ota::mark_current_valid()` only after the UI thread
-  has rendered a frame and Wi-Fi is up.
+- **Risk:** new image hangs early; user is left with a non-booting unit.
+- **Current state:** the stock bootloader shipped by `espflash` does
+  **not** honour `OtaImageState`, so there is no automatic rollback. A
+  bad image must be recovered by re-flashing over USB.
+- **Future mitigation:** ship a bootloader built with
+  `BOOTLOADER_APP_ROLLBACK_ENABLE`. Once that's in place, the existing
+  call to `Ota::mark_current_valid()` (already gated on UI + Wi-Fi
+  having come up) will arm proper rollback without further app-side
+  changes.
 
 ### 7.2 Existing device migration (Wi-Fi credentials)
 
@@ -403,10 +411,11 @@ command channel; the response funnels into `RadioState.ota_progress`.
     card with URL input, progress bar, and live status text.
   - **#11-7** `ota::mark_current_app_valid` runs once, immediately
     after the WiFi provisioner returns the flash handle and before
-    `PresetStore::open`. This commits the running image to the
-    bootloader's OTA-data so the device can't roll back on the next
-    reset. Failure is non-fatal (older partition layouts without
-    `otadata` simply skip the write).
+    `PresetStore::open`. This records `OtaImageState::Valid` in the
+    bootloader's OTA-data sector. The stock `espflash` bootloader does
+    not act on this field, so it is preparatory bookkeeping for a
+    future rollback-capable bootloader build. Failure is non-fatal
+    (older partition layouts without `otadata` simply skip the write).
   - **HTTPS deferred**: TLS via `esp-mbedtls` would add ~150 KiB to
     the image and meaningful boot-time/RAM cost. For the MVP, devices
     pull from a local dev server (run `cargo make ota-serve` from

@@ -10,7 +10,9 @@
 #               that offset inside `storage` means existing devices keep
 #               their saved Wi-Fi config across the partition-table change.
 #   - `otadata` two-sector slot the bootloader uses to track which
-#               app slot to boot (and rollback bookkeeping).
+#               app slot to boot. Also stores the per-image state
+#               field used by rollback-capable bootloader builds (the
+#               stock `espflash` bootloader ignores it today).
 #   - `ota_0`   primary app slot at 0x20000 — same offset espflash uses for
 #               the `single-app` factory image, so a single re-flash with
 #               `--partition-table partitions.csv` migrates existing devices

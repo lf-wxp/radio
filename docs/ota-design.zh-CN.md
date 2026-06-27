@@ -15,8 +15,11 @@
 ### 1.1 目标
 - 设备能够从可配置的 HTTP(S) URL 拉取新固件并在下次重启后启动。
 - 升级过程在 UI 上展示进度百分比、成功/失败状态。
-- 支持 **安全回滚**：新固件若在 N 次启动内未自标"健康"，bootloader
-  自动切回旧槽。
+- **回滚就绪**：在 `otadata` 中如实记录 OTA 镜像状态，
+  这样未来切到启用 `BOOTLOADER_APP_ROLLBACK_ENABLE` 的
+  bootloader 时无需再发一版固件即可生效。（`espflash` 随包的 stock
+  bootloader 当前不会根据这个字段自动回滚，所以这只是预留的
+  账本记录，本层并不会真正执行回滚动作。）
 - 触发方式：现有输入设备（旋钮长按）+ 未来的配套 App（Wi-Fi）。
 
 ### 1.2 非目标（延后）
@@ -239,12 +242,15 @@ pub async fn run_http_ota(
 
 ## 7. 风险与缓解
 
-### 7.1 坏镜像把设备砖了
-- **风险**：新固件早期挂死 → 来不及调用 `mark_app_valid_cancel_rollback`。
-- **缓解**：依赖 `esp-bootloader-esp-idf` 的回滚机制；要求应用在
-  UI 渲染出第一帧 + Wi-Fi 重新连上之后才调用
-  `Ota::mark_current_valid()`。
-
+### 7.1 坏镜像把设备砸了
+- **风险**：新固件早期挂死 → 设备无法启动。
+- **现状**：项目默认使用 `espflash` 随包的 stock
+  bootloader，它 **不** 会根据 `OtaImageState` 自动回滚。一旦
+  坏镜像被刷进去，必须走 USB 重新烧录才能恢复。
+- **未来缓解**：提供一个启用了
+  `BOOTLOADER_APP_ROLLBACK_ENABLE` 的 bootloader 构建。现有的
+  `Ota::mark_current_valid()` 调用（已经推到 UI 首帧 +
+  Wi-Fi 起来之后）不需任何 app 側改动，就能启用真正的回滚。
 ### 7.2 存量设备迁移（Wi-Fi 凭据）
 - 收音机的 WiFi 凭据存在 **flash 芯片的最后一个 sector**
   （`0x3F_F000`），由
@@ -361,8 +367,10 @@ pub async fn run_http_ota(
     含 URL 输入、进度条与实时状态文本。
   - **#11-7** `ota::mark_current_app_valid` 在 WiFi provisioner
     把 flash handle 还回来后、`PresetStore::open` 之前执行一次，
-    把当前运行镜像 commit 到 bootloader OTA-data，防止下次
-    reset 时回滚。失败非致命（旧分区表无 `otadata` 时直接跳过）。
+    在 bootloader 的 OTA-data 中记录 `OtaImageState::Valid`。
+    `espflash` 随包的 stock bootloader 并不会根据这个字段做
+    回滚动作，所以这是为未来支持回滚的 bootloader 预留的
+    账本记录。失败非致命（旧分区表无 `otadata` 时直接跳过）。
   - **HTTPS 推迟**：经由 `esp-mbedtls` 引入 TLS 大约会增加
     ~150 KiB 镜像 + 显著 boot/RAM 成本。MVP 阶段设备从局域网
     开发服务器拉取即可（仓库根目录运行 `cargo make ota-serve`，
