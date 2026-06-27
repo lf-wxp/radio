@@ -96,6 +96,18 @@ pub enum RadioCommand {
   /// Falls back to a `seek-up` inside the radio task when the preset
   /// table is empty, so the gesture stays useful from cold boot.
   CyclePreset,
+  /// Re-run the boot-time RSSI sweep across the whole FM band.
+  ///
+  /// Tunes through [`SPECTRUM_LEN`] buckets, samples RSSI on each, and
+  /// republishes [`RadioState::spectrum`]. The radio is briefly
+  /// off-air for the duration of the sweep (~4 s on a 52-bucket
+  /// band-plan; the buckets each settle for ~80 ms), then returns to
+  /// the original frequency.
+  ///
+  /// Triggered by the LAN web console "Scan" button. The handler is
+  /// careful to feed the watchdog mid-sweep because a full 52-bucket
+  /// pass would otherwise come within ~600 ms of the 5 s timeout.
+  SpectrumScan,
 }
 
 /// Snapshot of the user's saved presets, copied by value into

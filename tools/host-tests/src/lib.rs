@@ -22,6 +22,7 @@
 //! | [`url_parser`] | `src/bin/radio/ota/http_download.rs` | `http://<ipv4>[:port]/path` parser |
 //! | [`text`] | `src/bin/radio/listening_log.rs` | UTF-8-safe slice clipping |
 //! | [`rt_plus_parser`] | `src/si4703/mod.rs` | RT+ (RadioText Plus) bit-field parser |
+//! | [`spectrum`] | `src/si4703/mod.rs`, `src/bin/radio/ui.rs` | FM-band bucket centre + cursor index |
 //!
 //! ## Sync discipline
 //!
@@ -43,5 +44,6 @@
 pub mod mdns_parser;
 pub mod rt_plus_parser;
 pub mod sntp;
+pub mod spectrum;
 pub mod text;
 pub mod url_parser;

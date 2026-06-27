@@ -518,7 +518,7 @@ working days.
 | --- | ----------------------------------------------------------- | ------ | ------------------------------------------------------------------------------------ |
 | ✅  | RDS PTY (programme type) badge on the station card          | 0.5 d  | Block B already in the decoder — one bit-mask + 32-entry static table. Shipped 2026-06.|
 | ✅  | Stereo indicator + auto-mono on weak signal                 | 0.5 d  | Si4703 `STATUSRSSI` bit 8 + existing `set_mono`. Hysteresis controller in tasks.rs.    |
-| ✅  | RSSI band scope ("see-the-band" tuning UI)                  | 1 d    | Boot-time `sweep_rssi` over 87.5–108.0 MHz; 52-bucket bar chart with cursor highlight. Shipped 2026-06. |
+| ✅  | RSSI band scope ("see-the-band" tuning UI)                  | 1 d    | Boot-time `sweep_rssi` over 87.5–108.0 MHz; 52-bucket bar chart with cursor highlight on the LCD. Web console adds a second canvas chart fed by `GET /api/spectrum` plus a `Scan` button that triggers `POST /api/spectrum/scan` for an on-demand re-sweep. Shipped 2026-06. |
 | ✅  | Tune acceleration on the rotary encoder                     | 0.25 d | Detent-rate-driven step multiplier (×1/×2/×3/×5) with direction-reversal & idle resets. Shipped 2026-06. |
 | ✅  | Presets + restore last frequency on boot                    | 1.5 d  | `esp-storage` record at partition `storage` (0x3E_0000); short-press cycles saved stations, long-press saves, ultra-long mutes. Shipped 2026-06. |
 | ✅  | RDS-AF alternative-frequency follow                         | 2 d    | Group 0A block C parsed, PI gated; weak-signal probe ( ≤ 18 RSSI for 5 s) auto-hops to the strongest AF and rolls back if PI mismatches. Shipped 2026-06. |

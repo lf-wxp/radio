@@ -22,9 +22,9 @@ use crate::ota;
 use crate::presets::PresetStore;
 use crate::state::{
   DEFAULT_FREQ_X10, INPUT_CMDS, LAST_TUNED_DEBOUNCE_MS, LONG_PRESS_MS, OTA_CMDS, OtaCommand,
-  RADIO_STATE, RadioCommand, STATION_NAME_PLACEHOLDER, TUNE_STEP_X10, ULTRA_LONG_PRESS_MS,
-  clamp_freq, publish_af_status, publish_clock, publish_freq, publish_presets, publish_pty,
-  publish_radio_text, publish_rt_plus, publish_station_name,
+  RADIO_STATE, RadioCommand, SPECTRUM_LEN, STATION_NAME_PLACEHOLDER, TUNE_STEP_X10,
+  ULTRA_LONG_PRESS_MS, clamp_freq, publish_af_status, publish_clock, publish_freq, publish_presets,
+  publish_pty, publish_radio_text, publish_rt_plus, publish_spectrum, publish_station_name,
 };
 
 /// Tracks wall-clock time derived from RDS Group 4A (Clock-Time).
@@ -747,6 +747,9 @@ async fn handle_command(
         }
       }
     }
+    RadioCommand::SpectrumScan => {
+      run_spectrum_scan(radio_chip, i2c).await;
+    }
   }
 }
 
@@ -1101,6 +1104,84 @@ async fn run_af_probe(
   publish_presets(preset_store.snapshot(), target).await;
   publish_af_status(rds.alt_freqs().len() as u8, false).await;
   *last_tuned_pending = Some((target, Instant::now()));
+}
+
+/// How long we wait between tuning a spectrum bucket and reading its RSSI.
+///
+/// Same rationale as [`AF_SETTLE_MS`]: the Si4703 STC flag clears within
+/// ~60 ms but RSSI takes another ~80 ms to stabilise on the new carrier.
+/// The full sweep then takes [`SPECTRUM_LEN`] × `SPECTRUM_SETTLE_MS` ≈
+/// 4.2 s, which is uncomfortably close to the 5 s software watchdog —
+/// see [`run_spectrum_scan`] for the watchdog-feeding strategy.
+const SPECTRUM_SETTLE_MS: u64 = 80;
+
+/// Re-run the boot-time RSSI sweep across the whole FM band.
+///
+/// **Audible side-effect**: the radio is briefly off-air for the full
+/// duration of the sweep (~4 s on the 52-bucket plan). We restore the
+/// original frequency at the end so the listener resumes their station
+/// without further user interaction.
+///
+/// We deliberately re-implement the per-bucket loop here (instead of
+/// calling [`Si4703::sweep_rssi`]) because the driver method has no
+/// hook for feeding the software watchdog and the full sweep duration
+/// (~4.2 s) leaves only ~800 ms of headroom against the 5 s watchdog
+/// timeout — too tight to be comfortable. Inline-walking the buckets
+/// lets us feed the watchdog every iteration for free.
+async fn run_spectrum_scan(radio_chip: &mut Si4703, i2c: &mut I2c<'static, esp_hal::Blocking>) {
+  // Snapshot the listener's frequency so we can restore it after the
+  // sweep — without this the radio would be left parked at the top of
+  // the band, which is jarring.
+  let original_freq = match radio_chip.current_frequency(i2c) {
+    Ok(f) => f,
+    Err(_) => {
+      info!("Spectrum scan: aborted (cannot read current frequency)");
+      return;
+    }
+  };
+  info!("Spectrum scan: start (orig={})", original_freq);
+
+  let band = radio_chip.band();
+  let bottom = band.bottom_freq_mhz_x10();
+  let top = band.top_freq_mhz_x10();
+  // Inclusive span in 0.1 MHz units. Both bounds are < 1100, so the
+  // u16 subtraction is safe.
+  let span_x10 = u32::from(top.saturating_sub(bottom));
+
+  let mut samples = [0u8; SPECTRUM_LEN];
+  let n = SPECTRUM_LEN as u32;
+
+  for (i, slot) in samples.iter_mut().enumerate() {
+    // Bucket-i centre frequency, computed in u32 to avoid pulling in
+    // softfloat. Identical to [`Si4703::sweep_rssi`] so the bucket
+    // layout matches what `spectrum_cursor_for` expects.
+    let mid = u32::from(bottom) + (span_x10 * (2 * i as u32 + 1)) / (2 * n);
+    let freq = (mid.min(u32::from(top))) as u16;
+    match radio_chip.tune(i2c, freq).await {
+      Ok(()) => {
+        Timer::after(Duration::from_millis(SPECTRUM_SETTLE_MS)).await;
+        *slot = radio_chip.rssi(i2c).unwrap_or(0);
+      }
+      // A failed tune leaves the chip on the previous channel; record
+      // 0 for that bucket and continue so a single I²C glitch doesn't
+      // abort the whole sweep.
+      Err(_) => *slot = 0,
+    }
+    // Feed every iteration: the cumulative budget (settle + I2C) is
+    // ~80 ms per bucket and the watchdog tolerates 5 s, so even a
+    // 50 % fudge factor leaves us well inside the limit.
+    crate::diagnostics::watchdog_feed();
+  }
+
+  publish_spectrum(&samples).await;
+
+  // Restore the listener's station so audio resumes when the chip
+  // settles on the original carrier. Failure is non-fatal — the user
+  // can re-tune from the web console.
+  if radio_chip.tune(i2c, original_freq).await.is_err() {
+    info!("Spectrum scan: restore tune({}) failed", original_freq);
+  }
+  info!("Spectrum scan: done (restored to {})", original_freq);
 }
 
 // ============================================================================

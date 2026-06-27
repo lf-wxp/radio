@@ -237,6 +237,26 @@
         text-align: center;
         padding: 1rem 0;
       }
+      /* Spectrum chart styles. The <canvas> sizes itself via JS to
+         match its CSS pixel width × DPR for crisp bars on Retina
+         displays. The wrapper enforces a fixed CSS height so a slow
+         /api/spectrum response doesn't pop the layout. */
+      .spectrum {
+        display: block;
+        width: 100%;
+        height: 6.5rem;
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 0.5rem;
+      }
+      .spectrum-meta {
+        display: flex;
+        justify-content: space-between;
+        font-size: 0.72rem;
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+        margin-top: 0.25rem;
+      }
       .footer {
         font-size: 12px;
         color: var(--muted);
@@ -343,6 +363,21 @@
       </details>
     </section>
 
+    <section class="card" aria-labelledby="spectrumTitle">
+      <h2 id="spectrumTitle" style="margin:0 0 .5rem;font-size:.95rem;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.05em;">
+        FM spectrum
+      </h2>
+      <canvas id="spectrum" class="spectrum" aria-label="FM band RSSI sweep"></canvas>
+      <div class="spectrum-meta">
+        <span id="spectrumLow">87.5</span>
+        <span id="spectrumStatus">—</span>
+        <span id="spectrumHigh">108.0</span>
+      </div>
+      <div class="row" style="margin-top:.5rem;">
+        <button id="btnScan" class="primary" style="flex:1;">Scan</button>
+      </div>
+    </section>
+
     <section class="card" aria-labelledby="logTitle">
       <h2 id="logTitle" style="margin:0 0 .5rem;font-size:.95rem;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.05em;">
         Listening log
@@ -384,6 +419,34 @@
       $("btnSave").addEventListener("click", () => post("/api/preset/save"));
       $("btnMute").addEventListener("click", () => post("/api/mute"));
 
+      $("btnScan").addEventListener("click", async () => {
+        const btn = $("btnScan");
+        const status = $("spectrumStatus");
+        // Disable the trigger while the sweep is in flight so a second
+        // click cannot queue a duplicate command on the (size-8) input
+        // channel. The sweep takes ~4 s on the 52-bucket plan; we
+        // re-enable after a generous 6 s timeout regardless of whether
+        // the spectrum poll has caught up, so the UI stays unstuck if
+        // the device drops the response.
+        btn.disabled = true;
+        status.textContent = "scanning\u2026";
+        await post("/api/spectrum/scan");
+        // Poll the spectrum endpoint a few times so the bars refresh
+        // as soon as the device finishes; the 1 s state poller will
+        // also pick it up but the explicit fetch shortens UI latency.
+        const start = Date.now();
+        const tick = async () => {
+          await drawSpectrum();
+          if (Date.now() - start < 6000) {
+            setTimeout(tick, 800);
+          } else {
+            btn.disabled = false;
+            status.textContent = "\u2014";
+          }
+        };
+        setTimeout(tick, 1500);
+      });
+
       $("btnOta").addEventListener("click", () => {
         const url = $("otaUrl").value.trim();
         if (!url.startsWith("http://")) {
@@ -418,6 +481,78 @@
         el.hidden = false;
         el.textContent = text;
         el.classList.toggle("on", !!on);
+      };
+
+      // Pull the latest /api/spectrum snapshot and paint it as a
+      // bar chart on the <canvas>. Cheap enough to call on demand
+      // (once per scan + once on first load + every 10 s in case
+      // someone manually re-tunes elsewhere). 52 bars at ~6 px each
+      // fit comfortably on a 360 px-wide phone canvas; on a wider
+      // viewport the bars stretch but stay aligned to the band edges.
+      const drawSpectrum = async () => {
+        const canvas = $("spectrum");
+        if (!canvas) return;
+        let snap;
+        try {
+          const res = await fetch("/api/spectrum");
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          snap = await res.json();
+        } catch (e) {
+          $("err").textContent = `spectrum: ${e.message}`;
+          return;
+        }
+        const samples = snap.samples || [];
+        if (samples.length === 0) return;
+
+        // Match the device pixel ratio for crisp rendering on
+        // Retina / hi-DPI screens. The visible CSS size is unchanged.
+        const dpr = window.devicePixelRatio || 1;
+        const cssW = canvas.clientWidth;
+        const cssH = canvas.clientHeight;
+        if (canvas.width !== cssW * dpr || canvas.height !== cssH * dpr) {
+          canvas.width = Math.max(1, Math.floor(cssW * dpr));
+          canvas.height = Math.max(1, Math.floor(cssH * dpr));
+        }
+        const ctx = canvas.getContext("2d");
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, cssW, cssH);
+
+        const n = samples.length;
+        const slot = cssW / n;
+        const barGap = Math.max(1, slot * 0.15);
+        const barW = Math.max(1, slot - barGap);
+        // Si4703 RSSI scale is 0..=75; use 80 as the chart ceiling
+        // for some headroom so bars at peak still leave a px or two
+        // visible above the bar tip.
+        const scaleMax = 80;
+        const accent = getComputedStyle(document.documentElement)
+          .getPropertyValue("--accent")
+          .trim() || "#3b82f6";
+        const muted = getComputedStyle(document.documentElement)
+          .getPropertyValue("--muted")
+          .trim() || "#64748b";
+
+        // Where does the currently tuned frequency fall? We mirror
+        // the Rust-side bucket math: bucket i covers
+        //     [bottom + span*i/N, bottom + span*(i+1)/N)
+        // so the inverse `(freq - bottom) * N / span` lands the cursor.
+        const span = snap.top_x10 - snap.bottom_x10;
+        let cursor = -1;
+        if (snap.freq_x10 >= snap.bottom_x10 && span > 0) {
+          cursor = Math.min(
+            n - 1,
+            Math.floor(((snap.freq_x10 - snap.bottom_x10) * n) / span),
+          );
+        }
+
+        for (let i = 0; i < n; i++) {
+          const v = samples[i];
+          const h = (v / scaleMax) * (cssH - 4);
+          const x = i * slot + barGap / 2;
+          const y = cssH - h;
+          ctx.fillStyle = i === cursor ? accent : muted;
+          ctx.fillRect(x, y, barW, h);
+        }
       };
 
       const refresh = async () => {
@@ -497,6 +632,12 @@
 
       refresh();
       setInterval(refresh, 1000);
+      // Spectrum chart is much cheaper to refresh than full state but
+      // also stale on a longer timescale (RSSI changes are slow). Once
+      // on load + every 10 s catches manual retunes from the LCD knob;
+      // the Scan button does its own faster polling burst.
+      drawSpectrum();
+      setInterval(drawSpectrum, 10000);
 
       // Map an OtaProgressDto into the status label + progress bar.
       // Phases match `OtaProgressDto.phase` strings emitted by the

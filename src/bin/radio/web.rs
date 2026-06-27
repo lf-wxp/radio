@@ -196,6 +196,29 @@ struct LogDto {
   now_unix: Option<u64>,
   entries: alloc::vec::Vec<LogEntryDto>,
 }
+
+/// Wire shape for `GET /api/spectrum`.
+///
+/// `samples` is heap-allocated as `Vec<u8>` rather than the underlying
+/// `[u8; SPECTRUM_LEN]` because (a) `serde` only derives `Serialize`
+/// for arrays of length ≤ 32 and the spectrum is 52 buckets, and
+/// (b) keeping it heap-borne shaves the 52 byte buffer off the
+/// picoserve task's stack frame for this handler.
+///
+/// `bottom_x10` / `top_x10` describe the FM band the buckets span
+/// (in 0.1 MHz units, i.e. 875..=1080 for the US/Europe plan). Sent
+/// alongside the samples so the browser can label the X-axis without
+/// having to know the band-plan separately.
+#[derive(Serialize)]
+struct SpectrumDto {
+  samples: alloc::vec::Vec<u8>,
+  /// Currently tuned frequency in 0.1 MHz units. Used by the browser
+  /// to draw the cursor on the chart.
+  freq_x10: u16,
+  bottom_x10: u16,
+  top_x10: u16,
+}
+
 /// Body for `POST /api/tune`.
 #[derive(Deserialize)]
 struct TuneBody {
@@ -245,6 +268,7 @@ impl AppBuilder for AppProps {
         }),
       )
       .route("/api/state", get(handle_get_state))
+      .route("/api/spectrum", get(handle_get_spectrum))
       .route("/api/log", get(handle_get_log))
       .route("/api/tune", post(handle_post_tune))
       .route("/api/tune/up", post(handle_post_tune_up))
@@ -252,6 +276,7 @@ impl AppBuilder for AppProps {
       .route("/api/preset/cycle", post(handle_post_preset_cycle))
       .route("/api/preset/save", post(handle_post_preset_save))
       .route("/api/mute", post(handle_post_mute))
+      .route("/api/spectrum/scan", post(handle_post_spectrum_scan))
       .route("/api/ota", post(handle_post_ota))
       .route("/api/health", get(handle_get_health))
   }
@@ -320,6 +345,26 @@ async fn handle_get_state() -> picoserve::response::Json<StateDto> {
     ota: state.ota_progress.into(),
   };
   picoserve::response::Json(dto)
+}
+
+/// `GET /api/spectrum` — latest band-wide RSSI sweep snapshot.
+///
+/// Pulled out of `/api/state` so the 52-byte sample buffer doesn't
+/// inflate every state poll; the front-end only fetches the spectrum
+/// when the user opens the chart panel or hits the "Scan" button.
+///
+/// The bucket layout matches [`crate::state::SPECTRUM_LEN`] (52
+/// buckets across 87.5–108.0 MHz) and the cursor index is recomputed
+/// on the front-end with the same formula as
+/// [`crate::ui::spectrum_cursor_for`].
+async fn handle_get_spectrum() -> picoserve::response::Json<SpectrumDto> {
+  let state = RADIO_STATE.lock().await;
+  picoserve::response::Json(SpectrumDto {
+    samples: alloc::vec::Vec::from(state.spectrum),
+    freq_x10: state.freq_mhz_x10,
+    bottom_x10: 875,
+    top_x10: 1080,
+  })
 }
 
 /// `GET /api/log` — return the full listening-log ring buffer in
@@ -397,6 +442,21 @@ async fn handle_post_preset_save() -> Result<(), StatusCode> {
 /// `POST /api/mute` — toggle mute.
 async fn handle_post_mute() {
   send_command(RadioCommand::ToggleMute).await;
+}
+
+/// `POST /api/spectrum/scan` — re-run the band-wide RSSI sweep.
+///
+/// Enqueues a [`RadioCommand::SpectrumScan`]; the actual sweep runs
+/// inside [`crate::tasks::radio_control_task`] (~4 s of off-air time)
+/// and the result is published into [`RADIO_STATE`] when complete.
+/// The browser observes completion by polling `GET /api/state` and
+/// noticing the `spectrum` array has changed.
+///
+/// Returns `204 No Content` immediately on accept; the radio task is
+/// expected to honour the request within ~5 s but the HTTP layer does
+/// not block on completion so a slow sweep cannot hold the socket.
+async fn handle_post_spectrum_scan() {
+  send_command(RadioCommand::SpectrumScan).await;
 }
 
 /// `POST /api/ota` — start an OTA update from the supplied URL.
