@@ -485,7 +485,6 @@ BLE 射频、Flash。工时为单人投入估算。
 | ✅  | 局域网 Web 控制台（`/api/state`、`/api/tune`）       | 2 天    | 手机友好单页 HTML + JSON API，监听 80 端口；DHCP 完成后 LCD 底部显示访问 URL。已于 2026-06 交付。 |
 | ✅  | mDNS 广播 `esp-radio.local`                          | 1 天    | 监听 `224.0.0.251:5353` 的被动 A 记录响应器，配合 #7 让用户能在手机上直接访问 `http://esp-radio.local/`。已于 2026-06 交付。 |
 | ✅  | RDS 收听日志（PS/RT/RSSI 环形缓冲）                  | 1 天    | 64 条内存环形缓冲，每 10 秒采样一次；Web 控制台中"听音日志"面板呈现。Flash 持久化为保留 #11 的存储预算暂不实现。已于 2026-06 交付。 |
-| 10  | BLE HID 遥控（自拍器/翻页器风格）                    | 2–3 天  | `esp-radio` `ble` + `trouble-host` 依赖已就位；注意 Wi-Fi/BLE coex 风险。             |
 | 11  | OTA 固件升级                                         | 5 天    | **设计完成**，实施暂缓 → 详见 [docs/ota-design.zh-CN.md](./docs/ota-design.zh-CN.md)。 |
 
 ### 🚫 当前硬件下不做（透明列出）
@@ -494,7 +493,19 @@ BLE 射频、Flash。工时为单人投入估算。
 明确**不在**路线图内：
 
 - 网络电台播放（HLS / Icecast）—— 需要 I²S DAC + 解码器。
-- 经典蓝牙音频（A2DP source）—— `esp-radio` BLE 栈不覆盖经典蓝牙音频。
+- 经典蓝牙音频（A2DP source）—— 需要 Classic Bluetooth (BR/EDR) 射
+  频，而 ESP32-C6 是 BLE-only 芯片，硬件就跑不起来；即使换到支持
+  Classic 的 ESP32 系列，Rust 异步蓝牙生态（`esp-radio` /
+  `trouble-host` / `bt-hci`）也只覆盖 BLE，要做 A2DP source 就得切
+  回 ESP-IDF + Bluedroid (C)，并新增 I²S 音频 ADC 把 Si4703 模拟输
+  出采回数字，工程量等于重做项目。
+- BLE LE Audio source (Auracast / LC3) —— 芯片硬件支持，但 `esp-
+  radio` 的 BLE controller 暂未暴露 Isochronous Channels，
+  `crates.io` 上也没有 LC3 编码器。等上游协议栈和编码器到位后再评
+  估。
+- BLE HID 遥控 —— 已被 LAN Web 控制台（#7）覆盖：配对成本高、无屏
+  上反馈、Web UI 都能做到的事 BLE 也做不出花来，不值得为它维护
+  Wi-Fi/BLE coex。
 - 实时音频 FFT 频谱 —— 板子上没有音频 ADC 路径。
 - 触屏菜单 —— 当前 ST7789 模块无触摸层。
 - 电池电量挂件 —— 参考板未引出电量计 IC。

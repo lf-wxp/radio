@@ -491,7 +491,6 @@ working days.
 | 7   | LAN web console via `picoserve` (`/api/state`, `/api/tune`) | 2 d    | Tiny single-page HTML + JSON API; phone becomes a remote.                            |
 | ✅  | mDNS broadcast `esp-radio.local`                            | 1 d    | Passive A-record responder on `224.0.0.251:5353`; pairs with #7 so the user can browse `http://esp-radio.local/`. Shipped 2026-06. |
 | ✅  | RDS listening log (rolling buffer of PS/RT/RSSI)            | 1 d    | 64-entry in-RAM ring buffer sampled every 10 s; rendered by the web console under "Listening log". Flash persistence intentionally deferred to keep #11's flash budget. Shipped 2026-06. |
-| 10  | BLE HID remote (selfie-shutter style)                       | 2–3 d  | `esp-radio` `ble` + `trouble-host` already in `Cargo.toml`; mind Wi-Fi/BLE coex.     |
 | 11  | OTA firmware update                                         | 5 d    | **Design complete**, implementation deferred → [docs/ota-design.md](./docs/ota-design.md). |
 
 ### 🚫 Out of scope on current hardware
@@ -501,8 +500,19 @@ microphone, touch panel, fuel gauge IC) and are intentionally **not**
 on the roadmap:
 
 - Internet radio playback (HLS / Icecast) — needs an I²S DAC + decoder.
-- Bluetooth A2DP audio source — `esp-radio` BLE stack does not cover
-  classic Bluetooth audio profiles.
+- Bluetooth A2DP audio source — requires Classic Bluetooth (BR/EDR)
+  radio, which the ESP32-C6 silicon does not include (BLE-only). Even
+  on a Classic-capable chip the Rust async-Bluetooth ecosystem
+  (`esp-radio` / `trouble-host` / `bt-hci`) only covers BLE; A2DP
+  source would mean rewriting the project on ESP-IDF + Bluedroid in C
+  *and* adding an I²S audio ADC to digitise Si4703's analogue output.
+- BLE LE Audio source (Auracast / LC3) — silicon supports it, but the
+  Rust BLE controller in `esp-radio` does not yet expose Isochronous
+  Channels and there is no LC3 encoder on `crates.io`. Re-evaluate
+  when both upstream stacks ship the missing pieces.
+- BLE HID remote control — superseded by the LAN web console (#7);
+  pairing per phone, no on-screen feedback, and zero functions the
+  web UI cannot already do. Not worth the BLE-coex maintenance cost.
 - Real-time audio FFT spectrum — no audio ADC path on the board.
 - Touch-driven UI menus — current ST7789 module has no touch layer.
 - Battery fuel-gauge widget — depends on a battery-monitor IC the
