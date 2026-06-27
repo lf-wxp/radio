@@ -514,7 +514,7 @@ BLE 射频、Flash。工时为单人投入估算。
 | ✅  | 局域网 Web 控制台（`/api/state`、`/api/tune`）       | 2 天    | 手机友好单页 HTML + JSON API，监听 80 端口；DHCP 完成后 LCD 底部显示访问 URL。已于 2026-06 交付。 |
 | ✅  | mDNS 广播 `esp-radio.local`                          | 1 天    | 监听 `224.0.0.251:5353` 的被动 A 记录响应器，配合 #7 让用户能在手机上直接访问 `http://esp-radio.local/`。已于 2026-06 交付。 |
 | ✅  | RDS 收听日志（PS/RT/RSSI 环形缓冲）                  | 1 天    | 64 条内存环形缓冲，每 10 秒采样一次；Web 控制台中"听音日志"面板呈现。Flash 持久化为保留 #11 的存储预算暂不实现。已于 2026-06 交付。 |
-| 11  | OTA 固件升级                                         | 3 天    | 一期 ✅（分区表 + flash 交接已于 2026-06 交付）；二期a ✅（按扇区缓冲的 `OtaWriter` 已于 2026-06 交付）；HTTP 下载 / 校验 / UI 浮层待交付。决定复用 `esp-bootloader-esp-idf::OtaUpdater` 后，总工作量从 5 天压缩到 3 天。详见 [docs/ota-design.zh-CN.md](./docs/ota-design.zh-CN.md)。 |
+| ✅  | OTA 固件升级                                         | 3 天    | 全链路于 2026-06 交付：GPT 分区表、按扇区缓冲的 `OtaWriter`（复用 `esp-bootloader-esp-idf::OtaUpdater`）、HTTP 下载器、ESP 镜像头校验、Web 控制台触发（`POST /api/ota`）以及 LCD 上的全屏 Slint 进度浮层。`cargo make ota-serve` 启动内置 Rust 开发服务器并提供二维码；备忘在 [docs/ota-design.zh-CN.md](./docs/ota-design.zh-CN.md)。 |
 
 ### 🚫 当前硬件下不做（透明列出）
 

@@ -322,7 +322,7 @@ command channel; the response funnels into `RadioState.ota_progress`.
 | 4  | New `src/ota/http.rs` — reqwless wrapper, header parsing, retry policy        | 6        | pending  |
 | 5  | New `src/ota/verify.rs` — SHA-256 check + `esp_app_desc` sanity               | 3        | pending  |
 | 6  | Hook `RadioCommand::StartOta` into `tasks.rs`, progress channel               | 3        | pending  |
-| 7  | UI overlay (Slint) for progress %, success/failure                            | 4        | pending  |
+| 7  | UI overlay (Slint) for progress %, success/failure                            | 4        | done     |
 | 8  | `mark_app_valid_cancel_rollback` on healthy boot                              | 2        | pending  |
 | 9  | HTTPS feature flag + pinned-cert support (`embedded-tls`)                     | 6        | deferred |
 | 10 | E2E hardware test: flash A → OTA to B → reboot → OTA back to A                | 4        | pending  |

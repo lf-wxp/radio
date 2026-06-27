@@ -68,6 +68,28 @@ export component RadioWindow inherits MaterialWindow {
     // "P -/5" when current freq is unsaved, empty when none saved.
     in-out property <string> preset-text: "";
 
+    // ----- OTA progress overlay -----
+    // True while the OTA state machine is in any non-idle phase.
+    // Shows a fullscreen modal that masks the radio UI so the user
+    // can't accidentally tune mid-flash.
+    in-out property <bool> ota-active: false;
+    // Human-readable status line shown under the title, e.g.
+    // "Downloading 256.0 / 1480.5 KiB (17%)" or "Activating…".
+    in-out property <string> ota-status-text: "";
+    // 0.0..1.0 normalised progress driving the LinearProgressIndicator.
+    // The Rust side maps Connecting=0.05, Activating=0.95, Success=1.0,
+    // Failed=1.0; Downloading uses received/total when known.
+    in-out property <float> ota-progress: 0;
+    // True when total length is unknown (server returned no
+    // Content-Length): drives an indeterminate spinner instead of a
+    // determinate bar.
+    in-out property <bool> ota-indeterminate: false;
+    // Mutually-exclusive flags driving the progress-bar / status-text
+    // colour: success (tertiary green), failed (error red), otherwise
+    // primary blue.
+    in-out property <bool> ota-success: false;
+    in-out property <bool> ota-failed: false;
+
     // Computed: integer/decimal split for frequency display
     property <int> freq-int: freq-mhz-x10 / 10;
     property <int> freq-dec: mod(freq-mhz-x10, 10);
@@ -364,6 +386,78 @@ export component RadioWindow inherits MaterialWindow {
                     text: root.status-text;
                     style: MaterialTypography.label-small;
                     color: MaterialPalette.outline;
+                }
+            }
+        }
+    }
+
+    // ----- OTA progress overlay -----
+    //
+    // Sibling of the main VerticalLayout, parented directly under
+    // MaterialWindow (which inherits plain `Window`, so children are
+    // absolutely positioned). Sits above all other UI when visible.
+    //
+    // Hidden when ota-active is false; the Slint compiler still
+    // evaluates child bindings, but `visible: false` skips both the
+    // input handling and the rendering pass.
+    Rectangle {
+        visible: root.ota-active;
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        // Translucent scrim so the radio UI shows through faintly,
+        // matching Material's modal-overlay convention.
+        background: #000000c0;
+
+        // TouchArea swallows pointer events so the rotary input task's
+        // long-press / button events still flow (those go through the
+        // hardware GPIO path, not Slint), but stray screen taps don't
+        // reach the underlying buttons during a flash.
+        TouchArea { }
+
+        FilledCard {
+            x: 16px;
+            y: (parent.height - self.height) / 2;
+            width: parent.width - 32px;
+            height: 168px;
+
+            VerticalLayout {
+                padding: 16px;
+                spacing: 12px;
+                alignment: center;
+
+                MaterialText {
+                    text: "Firmware update";
+                    style: MaterialTypography.title-medium;
+                    color: MaterialPalette.on-surface;
+                    horizontal-alignment: center;
+                }
+
+                MaterialText {
+                    text: root.ota-status-text;
+                    style: MaterialTypography.body-small;
+                    color: root.ota-failed
+                        ? MaterialPalette.error
+                        : MaterialPalette.on-surface-variant;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+
+                LinearProgressIndicator {
+                    width: parent.width;
+                    progress: root.ota-progress;
+                    indeterminate: root.ota-indeterminate;
+                }
+
+                // Reboot hint: only shown on Success so the listener
+                // knows the new image is staged but not yet running.
+                MaterialText {
+                    text: "Power-cycle to apply";
+                    visible: root.ota-success;
+                    style: MaterialTypography.label-small;
+                    color: MaterialPalette.primary;
+                    horizontal-alignment: center;
                 }
             }
         }

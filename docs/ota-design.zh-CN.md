@@ -285,7 +285,7 @@ pub async fn run_http_ota(
 | 4    | `src/ota/http.rs`：reqwless 包装、Header 解析、重试策略                   | 6        | 待做 |
 | 5    | `src/ota/verify.rs`：SHA-256 校验 + `esp_app_desc` 完整性检查            | 3        | 待做 |
 | 6    | 在 `tasks.rs` 接入 `RadioCommand::StartOta`，进度通道贯通                  | 3        | 待做 |
-| 7    | Slint UI 进度浮层 + 成功/失败提示                                           | 4        | 待做 |
+| 7    | Slint UI 进度浮层 + 成功/失败提示                                           | 4        | 完成 |
 | 8    | 启动健康后调用 `mark_app_valid_cancel_rollback`                            | 2        | 待做 |
 | 9    | HTTPS feature flag + 固定根证书（`embedded-tls`）                          | 6        | 暂缓 |
 | 10   | 端到端硬件验证：刷 A → OTA 到 B → 重启 → OTA 回 A                          | 4        | 待做 |

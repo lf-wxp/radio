@@ -8,7 +8,7 @@ use slint::platform::software_renderer::MinimalSoftwareWindow;
 use radio::display::DisplayLineBuffer;
 
 use crate::RadioWindow;
-use crate::state::{RADIO_STATE, RadioState, SPECTRUM_LEN};
+use crate::state::{OtaProgress, RADIO_STATE, RadioState, SPECTRUM_LEN};
 
 /// Mirror a [`RadioState`] snapshot into the Slint component.
 #[allow(
@@ -93,6 +93,114 @@ fn apply_state_to_ui(ui: &RadioWindow, snapshot: &RadioState) {
   let spectrum_vec: alloc::vec::Vec<i32> = snapshot.spectrum.iter().map(|&v| v as i32).collect();
   ui.set_spectrum(slint::ModelRc::new(slint::VecModel::from(spectrum_vec)));
   ui.set_spectrum_cursor(spectrum_cursor_for(snapshot.freq_mhz_x10));
+
+  // -------- OTA progress overlay --------
+  //
+  // Map the [`OtaProgress`] state machine onto the six Slint
+  // properties consumed by the modal in `radio_ui.slint`. The overlay
+  // is hidden in `Idle` and shown otherwise; the progress bar value
+  // is normalised to 0.0..1.0, with sentinel waypoints for the phases
+  // that don't carry a byte counter.
+  apply_ota_to_ui(ui, snapshot.ota_progress);
+}
+
+/// Translate an [`OtaProgress`] phase into the Slint overlay's
+/// six in-out properties.
+///
+/// Pulled out of [`apply_state_to_ui`] purely for readability — it has
+/// six setters and a multi-arm match that would otherwise dwarf the
+/// rest of the snapshot apply.
+fn apply_ota_to_ui(ui: &RadioWindow, progress: OtaProgress) {
+  // Sentinel progress values for the phases without a byte counter.
+  // Picked so a glance at the bar reveals which phase is current
+  // even on a 240px-wide screen.
+  const CONNECTING_PROGRESS: f32 = 0.05;
+  const ACTIVATING_PROGRESS: f32 = 0.95;
+
+  let (active, status, value, indeterminate, success, failed) = match progress {
+    OtaProgress::Idle => (
+      false,
+      alloc::string::String::new(),
+      0.0,
+      false,
+      false,
+      false,
+    ),
+    OtaProgress::Connecting => (
+      true,
+      alloc::string::String::from("Connecting\u{2026}"),
+      CONNECTING_PROGRESS,
+      false,
+      false,
+      false,
+    ),
+    OtaProgress::Downloading { received, total } => {
+      // `total == 0` means the server didn't send Content-Length;
+      // fall back to an indeterminate spinner and just report the
+      // running byte count. Casts here are safe up to 4 GiB which
+      // is far above any realistic firmware size (current image is
+      // ~1.4 MiB).
+      let recv_kib = (received as f32) / 1024.0;
+      if total == 0 {
+        (
+          true,
+          alloc::format!("Downloading {:.1} KiB", recv_kib),
+          0.5,
+          true,
+          false,
+          false,
+        )
+      } else {
+        let total_kib = (total as f32) / 1024.0;
+        let ratio = (received as f32) / (total as f32);
+        let pct = (ratio * 100.0) as u32;
+        (
+          true,
+          alloc::format!(
+            "Downloading {:.1} / {:.1} KiB ({}%)",
+            recv_kib,
+            total_kib,
+            pct,
+          ),
+          ratio.clamp(0.0, 1.0),
+          false,
+          false,
+          false,
+        )
+      }
+    }
+    OtaProgress::Activating => (
+      true,
+      alloc::string::String::from("Activating\u{2026}"),
+      ACTIVATING_PROGRESS,
+      false,
+      false,
+      false,
+    ),
+    OtaProgress::Success => (
+      true,
+      alloc::string::String::from("Update staged"),
+      1.0,
+      false,
+      true,
+      false,
+    ),
+    OtaProgress::Failed(reason) => (
+      true,
+      alloc::format!("Failed: {}", reason),
+      1.0,
+      false,
+      false,
+      true,
+    ),
+  };
+
+  ui.set_ota_active(active);
+  ui.set_ota_status_text(status.as_str().into());
+  ui.set_ota_progress(value);
+  ui.set_ota_indeterminate(indeterminate);
+  ui.set_ota_success(success);
+  ui.set_ota_failed(failed);
 }
 
 /// Compute the index of the spectrum bucket containing `freq_mhz_x10`.
