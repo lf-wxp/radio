@@ -212,3 +212,54 @@ BINDGEN_EXTRA_CLANG_ARGS = {script = [
   "sdk=$(xcrun --show-sdk-path 2>/dev/null); if [ -n \"$sdk\" ]; then echo \"-isysroot $sdk -target $(uname -m)-apple-darwin\"; else echo; fi",
 ]}
 MACOSX_DEPLOYMENT_TARGET = "14.0"
+
+# ============================================================
+# OTA developer workflow (host-side, no ESP32 hardware needed for ota-serve)
+# ============================================================
+# Pipeline:
+#   1) `cargo make ota-image`  → builds release ELF and converts it to a flat
+#      `.bin` understood by the ESP32-C6 ROM bootloader, written next to the
+#      ELF as `radio.bin`.
+#   2) `cargo make ota-serve`  → starts the in-tree Rust dev server (lives
+#      under `tools/ota-serve/`) and prints `http://<lan-ip>:8000/firmware.bin`
+#      plus a terminal QR code. Paste the URL into the device's web console
+#      OTA card.
+#
+# The dev-server tool is a stand-alone host crate that sits OUTSIDE the
+# parent project's RISC-V build environment. Cargo would otherwise inherit
+# `.cargo/config.toml` (target = riscv32imac-…, `-Z stack-protector=all`,
+# `build-std`), which the host stable toolchain rejects. We override those
+# with environment variables defined under `[tasks.ota-serve.env]` below.
+
+[tasks.ota-image]
+description = "Convert the release ELF into a flashable .bin image (espflash save-image)"
+dependencies = ["build-release"]
+install_crate = {crate_name = "espflash", binary = "espflash", test_arg = "--version"}
+command = "espflash"
+args = [
+  "save-image",
+  "--chip", "${CHIP}",
+  "target/${TARGET}/release/radio",
+  "target/${TARGET}/release/radio.bin",
+]
+
+[tasks.ota-serve]
+description = "Serve the OTA image to the LAN with a Rust dev server (prints URL + QR code)"
+dependencies = ["ota-image"]
+command = "cargo"
+args = [
+  "run",
+  "--manifest-path", "tools/ota-serve/Cargo.toml",
+  "--release",
+  "--",
+  "--image", "target/${TARGET}/release/radio.bin",
+  "--port", "8000",
+]
+
+[tasks.ota-serve.env]
+# Force the host stable toolchain & host triple. Without these, cargo would
+# propagate the embedded RISC-V `target` and `-Z stack-protector` rustflags
+# from the parent project's `.cargo/config.toml`.
+RUSTUP_TOOLCHAIN = "stable"
+CARGO_BUILD_TARGET = {script = ["rustc -vV | sed -n 's/host: //p'"]}
+RUSTFLAGS = ""

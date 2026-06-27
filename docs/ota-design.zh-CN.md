@@ -365,6 +365,8 @@ pub async fn run_http_ota(
     reset 时回滚。失败非致命（旧分区表无 `otadata` 时直接跳过）。
   - **HTTPS 推迟**：经由 `esp-mbedtls` 引入 TLS 大约会增加
     ~150 KiB 镜像 + 显著 boot/RAM 成本。MVP 阶段设备从局域网
-    `python -m http.server` 拉取即可；公网 OTA 通道立项再做。
+    开发服务器拉取即可（仓库根目录运行 `cargo make ota-serve`，
+    详见 [tools/ota-serve/](../tools/ota-serve)）；公网 OTA 通道
+    立项再做。
   - `cargo make ci` + `cargo clippy --bin radio -- -D warnings` +
     `cargo build --bin radio --release` 全部绿色。

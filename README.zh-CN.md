@@ -42,6 +42,7 @@
   - [🧰 技术栈](#-技术栈)
   - [🌐 Web 控制台](#-web-控制台)
     - [REST API](#rest-api)
+    - [向设备推送固件升级（OTA）](#向设备推送固件升级ota)
   - [🐛 常见问题与 FAQ](#-常见问题与-faq)
   - [🗺️ 路线图](#️-路线图)
     - [✅ 已完成](#-已完成)
@@ -273,6 +274,8 @@ cargo make flash-example -e EXAMPLE=si4703_fm_radio
 | `ui-install-viewer`         | 安装 / 校验宿主机的 `slint-viewer`                            |
 | `ui-preview`                | 在宿主机实时预览 UI（保存自动刷新）                           |
 | `ui-preview-data`           | 同上，但预先加载 RDS / 音量样例数据                            |
+| `ota-image`                 | 调用 `espflash save-image` 组装一个可供 OTA 下发的 `radio.bin`     |
+| `ota-serve`                 | 依赖上一步，启动 Rust 开发服务器并打印 LAN URL 与二维码             |
 
 ---
 
@@ -394,9 +397,35 @@ RDS PS / RT / AF / 时钟徽标。页面每秒拉取一次设备状态。
 | POST   | `/api/preset/cycle`   | —                          | 跳到下一个收藏台（循环）。                                                  |
 | POST   | `/api/preset/save`    | —                          | 保存当前频率（33 个槽全满后 FIFO 淘汰）。                                  |
 | POST   | `/api/mute`           | —                          | 切换静音。                                                                  |
+| POST   | `/api/ota`            | `{"url":"http://…/firmware.bin"}` | 从 URL 拉取新固件到空闲槽，校验合法后标记为下次启动。             |
 
 所有命令走与旋钮完全相同的通道 —— web tune 与旋钮调台在控制任务内部自
 然串行，未新增任何额外锁。
+
+### 向设备推送固件升级（OTA）
+
+开发期要把新版本推给一台已联网的设备，一条命令就够：
+
+```bash
+cargo make ota-serve
+```
+
+这条任务会依次串起三个阶段，带你从源码变更一路走到“设备能下载
+的 URL”：
+
+1. `build-release` —— 带优化编译固件。
+2. `ota-image` —— 调用 `espflash save-image` 把 ELF 压成
+   `target/…/release/radio.bin` 平面镜像。
+3. `ota-serve` —— 启动仓库内的 Rust 开发服务器
+   （`tools/ota-serve/`）监听 `0.0.0.0:8000`，在 `/firmware.bin`
+   下提供镜像。终端会打印各 LAN 地址 + 二维码，手机扫一下
+   把出来的 URL 贴进 Web 控制台 OTA 卡片，看进度条跑完即可。
+
+这个服务器是一个独立的宿主机 crate，有意避开主项目面向
+ RISC-V 的 `.cargo/config.toml`；cargo make 任务会重设
+`RUSTUP_TOOLCHAIN` / `CARGO_BUILD_TARGET` / `RUSTFLAGS` 让主机
+稳定工具链能照常编译。不需要 `python -m http.server`，也
+不需要动 Cargo workspace，一句 `cargo make ota-serve` 到位。
 
 ---
 

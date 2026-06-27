@@ -1,0 +1,30 @@
+[package]
+name = "ota-serve"
+version = "0.1.0"
+edition = "2024"
+description = "Tiny single-file HTTP server for esp-radio OTA dev workflow"
+publish = false
+
+# Stand-alone crate intentionally NOT part of the parent project workspace:
+# the parent crate is locked to `riscv32imac-unknown-none-elf` via
+# `.cargo/config.toml`, while this tool is a host binary.
+[workspace]
+
+[[bin]]
+name = "ota-serve"
+path = "src/main.rs"
+
+[dependencies]
+tiny_http = "0.12"
+# qrcode upstream conflates "image renderer" with "alloc support" (no
+# explicit std/alloc feature), so its default features must stay on for the
+# Unicode renderer to compile. The transitive `image` crate is pulled in but
+# without its own default features (no PNG/JPEG codecs).
+qrcode = "0.14"
+local-ip-address = "0.6"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true

@@ -42,6 +42,7 @@
   - [🧰 Tech stack](#-tech-stack)
   - [🌐 Web console](#-web-console)
     - [REST API](#rest-api)
+    - [Pushing a firmware update (OTA)](#pushing-a-firmware-update-ota)
   - [🐛 Troubleshooting \& FAQ](#-troubleshooting--faq)
   - [🗺️ Roadmap](#️-roadmap)
     - [✅ Shipped](#-shipped)
@@ -273,6 +274,8 @@ cargo make flash-example -e EXAMPLE=si4703_fm_radio
 | `ui-install-viewer`         | Install / verify host-side `slint-viewer`                        |
 | `ui-preview`                | Live-preview the radio UI on the host (auto-reload)              |
 | `ui-preview-data`           | Same, but pre-loads sample RDS / volume data                     |
+| `ota-image`                 | Run `espflash save-image` to produce a flat `radio.bin`          |
+| `ota-serve`                 | Build above, then start the Rust dev OTA server with QR code     |
 
 ---
 
@@ -395,10 +398,39 @@ All endpoints live on port 80; bodies are JSON or empty.
 | POST   | `/api/preset/cycle`   | —                          | Jump to next saved preset (wraps).                                           |
 | POST   | `/api/preset/save`    | —                          | Persist current frequency (FIFO eviction past 8 slots).                      |
 | POST   | `/api/mute`           | —                          | Toggle mute.                                                                 |
+| POST   | `/api/ota`            | `{"url":"http://…/firmware.bin"}` | Stream a new firmware image into the inactive slot, verify, mark for next-boot. |
 
 Commands flow through the same channel as the rotary encoder, so a
 web tune and a knob turn always serialise correctly inside the radio
 task — no extra mutexes were added.
+
+### Pushing a firmware update (OTA)
+
+Development workflow for shipping a new build to a device that's
+already on the network:
+
+```bash
+cargo make ota-serve
+```
+
+The task chains three steps so a single command takes you from
+source changes to a downloadable image:
+
+1. `build-release` — compiles the firmware with optimisations.
+2. `ota-image` — runs `espflash save-image` to flatten the ELF into
+   `target/.../release/radio.bin`.
+3. `ota-serve` — boots the in-tree Rust dev server
+   (`tools/ota-serve/`) on `0.0.0.0:8000`, serving the image at
+   `/firmware.bin`. The terminal prints every reachable LAN URL
+   plus a QR code; just scan it from your phone, paste the URL into
+   the web console's OTA card, and watch the progress bar.
+
+The dev server is a stand-alone host-side crate. It deliberately
+lives outside the parent project's RISC-V `.cargo/config.toml` and
+overrides `RUSTUP_TOOLCHAIN` / `CARGO_BUILD_TARGET` / `RUSTFLAGS` in
+the `cargo make` task so the regular host stable toolchain is used.
+No system-wide `python -m http.server` invocation, no Cargo
+workspace surgery — `cargo make ota-serve` and you're done.
 
 ---
 

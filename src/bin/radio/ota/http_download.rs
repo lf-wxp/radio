@@ -5,8 +5,9 @@
 //!
 //! - **HTTP only** — TLS support is intentionally deferred (see
 //!   `docs/ota-design.md` § Roadmap). Threat model: the device is on a
-//!   trusted home network and pulls from the user's own host
-//!   (`python -m http.server`, GitHub Releases via reverse proxy, etc.).
+//!   trusted home network and pulls from the user's own host (the
+//!   in-tree dev server `cargo make ota-serve`, GitHub Releases via a
+//!   reverse proxy, etc.).
 //! - **IPv4 literal hosts only** — `embassy-net` is not built with the
 //!   `dns` feature in this project, so the URL host must be a numeric
 //!   IPv4 address (`http://192.168.1.10:8000/firmware.bin`). A future

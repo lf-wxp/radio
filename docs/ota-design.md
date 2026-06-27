@@ -409,8 +409,9 @@ command channel; the response funnels into `RadioState.ota_progress`.
     `otadata` simply skip the write).
   - **HTTPS deferred**: TLS via `esp-mbedtls` would add ~150 KiB to
     the image and meaningful boot-time/RAM cost. For the MVP, devices
-    pull from a local `python -m http.server` instance; HTTPS will
-    revisit when a public OTA channel is needed.
+    pull from a local dev server (run `cargo make ota-serve` from
+    the repo root — see [tools/ota-serve/](../tools/ota-serve));
+    HTTPS will revisit when a public OTA channel is needed.
   - `cargo make ci` + `cargo clippy --bin radio -- -D warnings` +
     `cargo build --bin radio --release` all green.
 
