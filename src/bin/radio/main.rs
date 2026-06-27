@@ -68,11 +68,6 @@ mod diagnostics;
 mod hardware;
 mod listening_log;
 mod mdns;
-#[expect(
-  dead_code,
-  reason = "OtaWriter is plumbed in #11-3 (HTTP downloader); landed early so the partition-table \
-    + flash-handover decisions ship with #11-2."
-)]
 mod ota;
 mod presets;
 mod state;
@@ -191,6 +186,11 @@ async fn main(spawner: Spawner) -> ! {
   let prov_config = ProvisioningConfig::default();
   let stack_resources = STACK_RESOURCES.init(StackResources::new());
 
+  // Captured for the radio control task so its OTA branch can open a
+  // TCP socket to the firmware host. `None` when WiFi failed at boot;
+  // OTA requests in that case fail fast with `OtaProgress::Failed("offline")`.
+  let mut wifi_stack: Option<embassy_net::Stack<'static>> = None;
+
   match provisioner
     .provision_and_connect(
       &spawner,
@@ -209,13 +209,6 @@ async fn main(spawner: Spawner) -> ! {
       state.status = "WiFi OK";
       state.dirty = true;
       drop(state);
-      // Spawn the LAN web console. picoserve's `Router` and `Config`
-      // both need a `'static` lifetime, so we lift them through
-      // `make_static!` here — they're tiny (PathRouter is a couple
-      // of pointers, Config is just timeouts) so static placement
-      // costs nothing. The web task itself waits for DHCP and
-      // publishes the IP back into [`RADIO_STATE`] so the LCD can
-      // show a `http://x.x.x.x` badge.
       let app: &'static picoserve::AppRouter<web::AppProps> = picoserve::make_static!(
         picoserve::AppRouter<web::AppProps>,
         <web::AppProps as picoserve::AppBuilder>::build_app(web::AppProps)
@@ -235,6 +228,7 @@ async fn main(spawner: Spawner) -> ! {
       // features (NTP, internet radio) can take ownership of the stack
       // before that.
       drop(connected);
+      wifi_stack = Some(stack);
       match web::web_task(stack, app, config) {
         Ok(token) => {
           spawner.spawn(token);
@@ -274,7 +268,14 @@ async fn main(spawner: Spawner) -> ! {
   // the steady state — once the radio task owns the store, it's the
   // sole writer.
   // ------------------------------------------------------------------------
-  let preset_store = PresetStore::open(provisioner.into_flash());
+  let mut flash = provisioner.into_flash();
+  // Anti-rollback latch: now that WiFi + display have come up cleanly,
+  // tell the bootloader to commit the running image. Failing this is
+  // non-fatal (older partition layouts without `otadata` simply skip
+  // the write), so we keep the `flash` handle for the preset store
+  // regardless. See `ota::mark_current_app_valid` for the rationale.
+  ota::mark_current_app_valid(&mut flash);
+  let preset_store = PresetStore::open(flash);
   let stored_presets = preset_store.snapshot();
   info!(
     "Presets loaded: {} saved, last_tuned={}",
@@ -419,7 +420,7 @@ async fn main(spawner: Spawner) -> ! {
   // ------------------------------------------------------------------------
   spawner.spawn(tasks::input_task(encoder).expect("create input_task token"));
   spawner.spawn(
-    tasks::radio_control_task(radio_chip, i2c, preset_store)
+    tasks::radio_control_task(radio_chip, i2c, preset_store, wifi_stack)
       .expect("create radio_control_task token"),
   );
   // Listening-log sampler: pure software task that snapshots

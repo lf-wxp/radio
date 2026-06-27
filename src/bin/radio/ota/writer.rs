@@ -60,6 +60,23 @@ use esp_storage::{FlashStorage, FlashStorageError};
 /// Flash sector size (also the erase granularity) on the ESP32-C6.
 const SECTOR_SIZE: usize = 4096;
 
+/// Bytes of ESP image header we inspect before accepting the rest of the
+/// stream. The on-flash header is 24 bytes; we only need the first 14 to
+/// validate magic + chip id, but reading the full block keeps us aligned
+/// with the ESP-IDF layout if we later want to surface entry-point or
+/// segment count.
+const HEADER_LEN: usize = 24;
+
+/// First byte of every ESP image — see ESP-IDF `esp_image_format.h`.
+const ESP_IMAGE_MAGIC: u8 = 0xE9;
+
+/// `chip_id` value the bootloader writes into byte offsets 0x0C..0x0E for
+/// ESP32-C6 firmware. Matches `ESP_CHIP_ID_ESP32C6` in ESP-IDF. We hard-code
+/// this because the crate is built exclusively for the C6 target (see the
+/// `esp32c6` feature pinned in `Cargo.toml`); flashing a binary built for a
+/// different chip would brick the radio on next boot.
+const EXPECTED_CHIP_ID: u16 = 0x000D;
+
 /// Errors that can occur while staging an OTA image.
 #[derive(Debug, Format, Clone, Copy, PartialEq, Eq)]
 pub enum OtaError {
@@ -68,6 +85,10 @@ pub enum OtaError {
   /// Caller declared an `expected_size` in `begin` but `finalize` saw a
   /// different number of bytes. Indicates a truncated download.
   SizeMismatch { expected: u32, received: u32 },
+  /// First [`HEADER_LEN`] bytes do not look like an ESP image (bad magic
+  /// or chip-id mismatch). Caught before any flash sectors are activated
+  /// in OTA-data, so the running image stays untouched.
+  BadImageHeader { magic: u8, chip_id: u16 },
   /// `OtaUpdater::next_partition` could not find an inactive OTA slot.
   /// Usually means the partition table lacks `ota_0`/`ota_1`/`otadata`.
   SlotNotFound,
@@ -127,6 +148,9 @@ pub struct OtaWriter<'d> {
   accepted_bytes: u32,
   /// Optional caller-declared image size for progress / cross-check.
   expected_size: Option<u32>,
+  /// `true` once the first [`HEADER_LEN`] bytes have been validated.
+  /// Prevents activating an image with the wrong magic / chip id.
+  header_verified: bool,
 }
 
 impl<'d> OtaWriter<'d> {
@@ -174,13 +198,21 @@ impl<'d> OtaWriter<'d> {
       flushed_sectors: 0,
       accepted_bytes: 0,
       expected_size,
+      header_verified: false,
     })
   }
 
   /// Append `chunk` bytes to the staged image. Yields to the executor after
   /// each completed sector flush.
   ///
+  /// The first [`HEADER_LEN`] bytes are inspected against
+  /// [`ESP_IMAGE_MAGIC`] / [`EXPECTED_CHIP_ID`] before any sector is
+  /// activated; a bad header causes [`OtaError::BadImageHeader`] and the
+  /// caller can [`abort`](Self::abort) without touching OTA-data.
+  ///
   /// # Errors
+  /// - [`OtaError::BadImageHeader`] if the first 24 bytes are not a valid
+  ///   ESP image header for this chip.
   /// - [`OtaError::ImageTooLarge`] if the cumulative bytes would overflow
   ///   the target slot.
   /// - [`OtaError::Flash`] for SPI flash erase/program failures.
@@ -194,6 +226,16 @@ impl<'d> OtaWriter<'d> {
       self.accepted_bytes = self.accepted_bytes.saturating_add(take as u32);
       remaining = &remaining[take..];
 
+      // Validate the image header as soon as we've accumulated enough
+      // bytes, but BEFORE the first sector flush. We only ever flush full
+      // sectors (4096 ≫ 24), so the header always lands inside the first
+      // sector and stays available in `sector_buf`.
+      if !self.header_verified && self.buf_used >= HEADER_LEN {
+        verify_image_header(&self.sector_buf[..HEADER_LEN])?;
+        self.header_verified = true;
+        info!("OTA image header OK (magic=0xE9, chip=ESP32-C6)");
+      }
+
       if self.buf_used == SECTOR_SIZE {
         self.flush_sector()?;
         // Cooperative yield so embassy can run the WiFi driver / WDT feeder.
@@ -205,11 +247,21 @@ impl<'d> OtaWriter<'d> {
 
   /// Bytes accepted so far (`write_chunk` lengths summed). Useful for UI
   /// progress.
+  #[allow(
+    dead_code,
+    reason = "Currently superseded by OtaProgress state machine; kept as a stable \
+      API for future external consumers (CLI tooling, integration tests)"
+  )]
   pub fn bytes_written(&self) -> u32 {
     self.accepted_bytes
   }
 
   /// Progress as 0..=100 if `expected_size` was given to [`begin`](Self::begin).
+  #[allow(
+    dead_code,
+    reason = "Same rationale as `bytes_written`: convenience accessor exposed for \
+      callers that don't subscribe to the OtaProgress state machine"
+  )]
   pub fn progress_percent(&self) -> Option<u8> {
     let expected = self.expected_size?;
     if expected == 0 {
@@ -229,6 +281,16 @@ impl<'d> OtaWriter<'d> {
   /// - [`OtaError::Flash`] for the final program / OTA-data write.
   /// - [`OtaError::Partition`] for OTA-data parse failures.
   pub fn finalize(mut self) -> Result<FlashStorage<'d>, OtaError> {
+    // Defence in depth: a stream that ends before HEADER_LEN bytes is
+    // certainly not a valid image. `verify_image_header` is normally hit
+    // inside `write_chunk`; this branch covers truncated downloads.
+    if !self.header_verified {
+      return Err(OtaError::BadImageHeader {
+        magic: self.sector_buf.first().copied().unwrap_or(0),
+        chip_id: 0,
+      });
+    }
+
     if let Some(expected) = self.expected_size
       && expected != self.accepted_bytes
     {
@@ -370,4 +432,83 @@ fn pt_buf_as_array(buf: &mut Box<[u8]>) -> &mut [u8; PARTITION_TABLE_MAX_LEN] {
   (&mut **buf)
     .try_into()
     .expect("pt_buffer length matches PARTITION_TABLE_MAX_LEN")
+}
+
+/// Validate the first [`HEADER_LEN`] bytes of an OTA stream.
+///
+/// The ESP image format starts with:
+///
+/// | Offset | Size | Field         |
+/// |--------|------|---------------|
+/// | 0x00   | 1    | `magic` = 0xE9|
+/// | 0x01   | 1    | segment count |
+/// | 0x02   | 1    | spi mode      |
+/// | 0x03   | 1    | spi speed/size|
+/// | 0x04   | 4    | entry addr    |
+/// | 0x08   | 1    | wp pin        |
+/// | 0x09   | 3    | spi pin drv   |
+/// | 0x0C   | 2    | `chip_id` (LE)|
+///
+/// We deliberately keep the check minimal — full app-descriptor parsing
+/// (project name, version, IDF magic) lives behind the same buffer and
+/// will be wired up in a follow-up if/when needed.
+fn verify_image_header(header: &[u8]) -> Result<(), OtaError> {
+  // Caller is responsible for slicing exactly HEADER_LEN bytes.
+  debug_assert_eq!(header.len(), HEADER_LEN);
+
+  let magic = header[0];
+  let chip_id = u16::from_le_bytes([header[0x0C], header[0x0D]]);
+
+  if magic != ESP_IMAGE_MAGIC || chip_id != EXPECTED_CHIP_ID {
+    warn!(
+      "OTA image header rejected: magic=0x{:02x} (want 0xE9), chip_id=0x{:04x} (want 0x{:04x})",
+      magic, chip_id, EXPECTED_CHIP_ID
+    );
+    return Err(OtaError::BadImageHeader { magic, chip_id });
+  }
+  Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// Build a 24-byte buffer with the supplied `magic` and `chip_id`.
+  fn synthetic_header(magic: u8, chip_id: u16) -> [u8; HEADER_LEN] {
+    let mut h = [0u8; HEADER_LEN];
+    h[0] = magic;
+    h[1] = 4; // segment count, arbitrary
+    let cid = chip_id.to_le_bytes();
+    h[0x0C] = cid[0];
+    h[0x0D] = cid[1];
+    h
+  }
+
+  #[test]
+  fn accepts_valid_c6_header() {
+    let h = synthetic_header(ESP_IMAGE_MAGIC, EXPECTED_CHIP_ID);
+    assert!(verify_image_header(&h).is_ok());
+  }
+
+  #[test]
+  fn rejects_bad_magic() {
+    let h = synthetic_header(0xAB, EXPECTED_CHIP_ID);
+    assert!(matches!(
+      verify_image_header(&h),
+      Err(OtaError::BadImageHeader { magic: 0xAB, .. })
+    ));
+  }
+
+  #[test]
+  fn rejects_wrong_chip_id() {
+    // 0x0009 is ESP32-S3; flashing it onto a C6 would brick the radio.
+    let h = synthetic_header(ESP_IMAGE_MAGIC, 0x0009);
+    assert!(matches!(
+      verify_image_header(&h),
+      Err(OtaError::BadImageHeader {
+        chip_id: 0x0009,
+        ..
+      })
+    ));
+  }
 }

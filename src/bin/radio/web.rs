@@ -27,7 +27,10 @@ use picoserve::{AppBuilder, AppRouter, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::diagnostics::{self, HealthDto};
-use crate::state::{INPUT_CMDS, PRESET_EMPTY, RADIO_STATE, RadioCommand, publish_web_ip};
+use crate::state::{
+  INPUT_CMDS, OTA_CMDS, OtaCommand, OtaProgress, PRESET_EMPTY, RADIO_STATE, RadioCommand,
+  publish_web_ip,
+};
 
 // ============================================================================
 // Configuration
@@ -83,6 +86,72 @@ struct StateDto {
   presets: [u16; crate::state::MAX_PRESETS],
   wifi_ssid: alloc::string::String,
   wifi_connected: bool,
+  /// Latest snapshot of the OTA state machine. See [`OtaProgressDto`].
+  ota: OtaProgressDto,
+}
+
+/// Wire shape of [`OtaProgress`] for the front-end progress widget.
+///
+/// Flattened into a discriminated union so JS can render with a simple
+/// `switch (ota.phase)` without parsing nested Rust-style enum tags.
+///
+/// `received` / `total` are only populated when `phase == "downloading"`;
+/// `reason` is only populated when `phase == "failed"`. Other
+/// combinations stay `null` so the JSON stays small at idle.
+#[derive(Serialize)]
+struct OtaProgressDto {
+  phase: &'static str,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  received: Option<u32>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  total: Option<u32>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  reason: Option<&'static str>,
+}
+
+impl From<OtaProgress> for OtaProgressDto {
+  fn from(p: OtaProgress) -> Self {
+    match p {
+      OtaProgress::Idle => Self {
+        phase: "idle",
+        received: None,
+        total: None,
+        reason: None,
+      },
+      OtaProgress::Connecting => Self {
+        phase: "connecting",
+        received: None,
+        total: None,
+        reason: None,
+      },
+      OtaProgress::Downloading { received, total } => Self {
+        phase: "downloading",
+        received: Some(received),
+        // `total = 0` means the server didn't send Content-Length.
+        // Surface as `null` so JS can render an indeterminate spinner.
+        total: if total == 0 { None } else { Some(total) },
+        reason: None,
+      },
+      OtaProgress::Activating => Self {
+        phase: "activating",
+        received: None,
+        total: None,
+        reason: None,
+      },
+      OtaProgress::Success => Self {
+        phase: "success",
+        received: None,
+        total: None,
+        reason: None,
+      },
+      OtaProgress::Failed(reason) => Self {
+        phase: "failed",
+        received: None,
+        total: None,
+        reason: Some(reason),
+      },
+    }
+  }
 }
 
 /// One row in the `GET /api/log` response.
@@ -113,6 +182,15 @@ struct LogDto {
 struct TuneBody {
   /// Target frequency in 0.1 MHz units (e.g. `1015` = 101.5 MHz).
   freq_x10: u16,
+}
+
+/// Body for `POST /api/ota`.
+#[derive(Deserialize)]
+struct OtaBody {
+  /// Plain-HTTP firmware URL with an IPv4 literal host, e.g.
+  /// `http://192.168.1.10:8000/firmware.bin`. See
+  /// [`crate::ota::http_download`] for the parser's full grammar.
+  url: alloc::string::String,
 }
 
 // ============================================================================
@@ -155,6 +233,7 @@ impl AppBuilder for AppProps {
       .route("/api/preset/cycle", post(handle_post_preset_cycle))
       .route("/api/preset/save", post(handle_post_preset_save))
       .route("/api/mute", post(handle_post_mute))
+      .route("/api/ota", post(handle_post_ota))
       .route("/api/health", get(handle_get_health))
   }
 }
@@ -190,6 +269,7 @@ async fn handle_get_state() -> picoserve::response::Json<StateDto> {
     presets: state.presets.freqs,
     wifi_ssid: state.wifi_ssid.clone(),
     wifi_connected: state.wifi_connected,
+    ota: state.ota_progress.into(),
   };
   picoserve::response::Json(dto)
 }
@@ -265,11 +345,53 @@ async fn handle_post_preset_save() -> Result<(), StatusCode> {
   Ok(())
 }
 
-/// `POST /api/mute` \u2014 toggle mute.
+/// `POST /api/mute` — toggle mute.
 async fn handle_post_mute() {
   send_command(RadioCommand::ToggleMute).await;
 }
 
+/// `POST /api/ota` — start an OTA update from the supplied URL.
+///
+/// Body: `{ "url": "http://192.168.1.10:8000/firmware.bin" }`.
+///
+/// Validates that the scheme is `http://` and that the URL is
+/// reasonably sized; deeper checks (IPv4 literal, port range) happen
+/// inside [`crate::ota::http_download::parse_url`] so we don't
+/// duplicate the parser. On accept the request returns immediately
+/// with `204 No Content`; the actual download runs in
+/// [`crate::tasks::radio_control_task`] and progress is exposed
+/// through `GET /api/state`'s `ota` field.
+///
+/// Returns:
+/// - `204 No Content` on accept (download started in background).
+/// - `400 Bad Request` for an empty / oversized URL or non-HTTP scheme.
+/// - `409 Conflict` if an OTA job is already running.
+async fn handle_post_ota(Json(body): Json<OtaBody>) -> Result<(), StatusCode> {
+  // Bound the URL length so we don't blow heap on a hostile client.
+  // 256 chars is more than enough for any realistic LAN address.
+  if body.url.is_empty() || body.url.len() > 256 {
+    return Err(StatusCode::BAD_REQUEST);
+  }
+  if !body.url.starts_with("http://") {
+    return Err(StatusCode::BAD_REQUEST);
+  }
+
+  // Single-flight: refuse if an update is already in progress so a
+  // refreshed browser tab can't accidentally fire two downloads at
+  // the flash peripheral.
+  {
+    let state = RADIO_STATE.lock().await;
+    if state.ota_in_progress {
+      return Err(StatusCode::CONFLICT);
+    }
+  }
+
+  // The signal is single-slot; an in-flight job inspects the URL
+  // exactly once via [`Signal::wait`], so a stale URL queued behind
+  // a running job is naturally discarded.
+  OTA_CMDS.signal(OtaCommand::Start(body.url));
+  Ok(())
+}
 // ============================================================================
 // Helpers
 // ============================================================================

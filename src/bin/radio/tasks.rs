@@ -7,8 +7,9 @@
 //!   refreshes RSSI/RDS into the shared [`crate::state::RADIO_STATE`].
 
 use defmt::info;
-use embassy_futures::select::{Either, select};
+use embassy_futures::select::{Either3, select3};
 use embassy_futures::yield_now;
+use embassy_net::Stack;
 use embassy_time::{Duration, Instant, Timer};
 use esp_hal::i2c::master::I2c;
 
@@ -17,12 +18,13 @@ use alloc::string::String;
 use radio::rotary_encoder::RotaryEncoder;
 use radio::si4703::{RdsClockTime, RdsDecoder, SeekDirection, Si4703};
 
+use crate::ota;
 use crate::presets::PresetStore;
 use crate::state::{
-  DEFAULT_FREQ_X10, INPUT_CMDS, LAST_TUNED_DEBOUNCE_MS, LONG_PRESS_MS, RADIO_STATE, RadioCommand,
-  STATION_NAME_PLACEHOLDER, TUNE_STEP_X10, ULTRA_LONG_PRESS_MS, clamp_freq, publish_af_status,
-  publish_clock, publish_freq, publish_presets, publish_pty, publish_radio_text,
-  publish_station_name,
+  DEFAULT_FREQ_X10, INPUT_CMDS, LAST_TUNED_DEBOUNCE_MS, LONG_PRESS_MS, OTA_CMDS, OtaCommand,
+  RADIO_STATE, RadioCommand, STATION_NAME_PLACEHOLDER, TUNE_STEP_X10, ULTRA_LONG_PRESS_MS,
+  clamp_freq, publish_af_status, publish_clock, publish_freq, publish_presets, publish_pty,
+  publish_radio_text, publish_station_name,
 };
 
 /// Tracks wall-clock time derived from RDS Group 4A (Clock-Time).
@@ -423,10 +425,17 @@ pub async fn input_task(mut encoder: RotaryEncoder<'static, 0>) -> ! {
 ///   immediately, while `last_tuned` is debounced for
 ///   [`LAST_TUNED_DEBOUNCE_MS`] to keep flash erase counts low.
 #[embassy_executor::task]
+#[allow(
+  clippy::large_stack_frames,
+  reason = "the task aggregates RDS decoder, RDS string buffers, MonoController, AfFollower, and \
+            the optional preset store + WiFi stack handle. ~1.1 KiB stays well under the 16 KiB \
+            Embassy task stack on ESP32-C6."
+)]
 pub async fn radio_control_task(
   mut radio_chip: Si4703,
   mut i2c: I2c<'static, esp_hal::Blocking>,
-  mut preset_store: PresetStore<'static>,
+  preset_store: PresetStore<'static>,
+  stack: Option<Stack<'static>>,
 ) -> ! {
   let mut rds = RdsDecoder::new();
   let mut last_rds_name = String::from(STATION_NAME_PLACEHOLDER);
@@ -445,28 +454,43 @@ pub async fn radio_control_task(
   // instant is older than `LAST_TUNED_DEBOUNCE_MS` we flush it.
   let mut last_tuned_pending: Option<(u16, Instant)> = None;
 
+  // The preset store owns the singleton flash handle. We wrap it in an
+  // `Option` so the OTA path can `take()` the store, surrender the
+  // flash to [`crate::ota::run_job`] for the duration of the download,
+  // and put a fresh store back together on completion. `None` is only
+  // ever observed transiently while the OTA job runs; every other code
+  // path is allowed to `expect()` the inner value.
+  let mut preset_store: Option<PresetStore<'static>> = Some(preset_store);
+
   loop {
-    match select(
+    match select3(
       INPUT_CMDS.receive(),
       Timer::after(Duration::from_millis(200)),
+      OTA_CMDS.wait(),
     )
     .await
     {
-      Either::First(command) => {
+      Either3::First(command) => {
         crate::diagnostics::watchdog_feed();
+        let store = preset_store
+          .as_mut()
+          .expect("preset store available outside OTA");
         handle_command(
           &mut radio_chip,
           &mut i2c,
           command,
           &mut rds,
           &mut wall_clock,
-          &mut preset_store,
+          store,
           &mut last_tuned_pending,
         )
         .await;
       }
-      Either::Second(_) => {
+      Either3::Second(_) => {
         crate::diagnostics::watchdog_feed();
+        let store = preset_store
+          .as_mut()
+          .expect("preset store available outside OTA");
         let probe_armed = {
           let mut ctx = RefreshContext {
             rds: &mut rds,
@@ -488,7 +512,7 @@ pub async fn radio_control_task(
             &mut i2c,
             &mut rds,
             &mut wall_clock,
-            &mut preset_store,
+            store,
             &mut last_tuned_pending,
           )
           .await;
@@ -496,10 +520,56 @@ pub async fn radio_control_task(
         // Opportunistic flash flush: piggy-back on the 200 ms tick
         // instead of a third `select` arm. Worst-case latency is one
         // tick beyond the debounce window, which is fine.
-        flush_last_tuned_if_due(&mut preset_store, &mut last_tuned_pending);
+        flush_last_tuned_if_due(store, &mut last_tuned_pending);
+      }
+      Either3::Third(cmd) => {
+        crate::diagnostics::watchdog_feed();
+        handle_ota_command(&mut preset_store, &mut last_tuned_pending, stack, cmd).await;
       }
     }
   }
+}
+
+/// Hand the flash handle to the OTA pipeline and re-establish the
+/// preset store on completion.
+///
+/// Steps:
+///
+/// 1. Drop any pending `last_tuned` write — we don't want a flash
+///    op in flight when we surrender the handle. The frequency is
+///    re-armed for persistence by the next tune.
+/// 2. `pause()` the store to extract the [`FlashStorage`].
+/// 3. Run the download via [`crate::ota::run_job`].
+/// 4. `resume()` the paused token with the returned flash handle.
+///
+/// If the WiFi stack is unavailable (offline boot), publish a
+/// `Failed("offline")` and return without touching flash.
+async fn handle_ota_command(
+  store_slot: &mut Option<PresetStore<'static>>,
+  last_tuned_pending: &mut Option<(u16, Instant)>,
+  stack: Option<Stack<'static>>,
+  cmd: OtaCommand,
+) {
+  let OtaCommand::Start(url) = cmd;
+
+  let Some(stack) = stack else {
+    defmt::warn!("OTA requested but WiFi stack is offline");
+    crate::state::publish_ota_progress(crate::state::OtaProgress::Failed("offline")).await;
+    return;
+  };
+
+  // Drop the debounce so we don't try to flash the storage partition
+  // moments before yielding the handle. The next tune will re-arm it.
+  *last_tuned_pending = None;
+
+  let Some(store) = store_slot.take() else {
+    defmt::warn!("OTA already in progress — ignoring duplicate request");
+    return;
+  };
+
+  let (flash, paused) = store.pause();
+  let flash = ota::run_job(stack, flash, url).await;
+  *store_slot = Some(paused.resume(flash));
 }
 
 /// Persist `last_tuned` once the debounce window has elapsed.

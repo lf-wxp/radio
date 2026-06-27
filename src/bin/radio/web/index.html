@@ -226,6 +226,41 @@
         text-align: center;
         min-height: 1em;
       }
+      /* OTA card
+         - hidden by default; revealed via the "Firmware" toggle so the
+           rare-use control doesn't crowd day-to-day buttons.
+         - progress bar reuses the .meter palette for visual consistency
+           with the RSSI strength meter. */
+      details.ota > summary {
+        cursor: pointer;
+        font-size: 12px;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        list-style: none;
+      }
+      details.ota > summary::-webkit-details-marker {
+        display: none;
+      }
+      details.ota[open] > summary::after {
+        content: " \25B2";
+      }
+      details.ota:not([open]) > summary::after {
+        content: " \25BC";
+      }
+      .ota-status {
+        font-size: 13px;
+        color: var(--muted);
+        margin: 8px 0;
+        min-height: 1.2em;
+        font-variant-numeric: tabular-nums;
+      }
+      .ota-status.ok {
+        color: #4ade80;
+      }
+      .ota-status.fail {
+        color: var(--err);
+      }
     </style>
   </head>
   <body>
@@ -264,6 +299,24 @@
       </div>
       <div class="presets" id="presets"></div>
       <div class="err" id="err"></div>
+    </section>
+
+    <section class="card">
+      <details class="ota">
+        <summary>Firmware update</summary>
+        <p style="font-size:12px;color:var(--muted);margin:8px 0;">
+          Plain HTTP only, IPv4 host. Example:
+          <code>http://192.168.1.10:8000/firmware.bin</code>.
+          The device stays running until the new image is fully staged;
+          reboot manually after success.
+        </p>
+        <div class="row">
+          <input id="otaUrl" type="text" inputmode="url" placeholder="http://..." autocomplete="off" spellcheck="false" style="flex:2;" />
+          <button id="btnOta" class="primary" style="flex:1;">Update</button>
+        </div>
+        <div id="otaStatus" class="ota-status" aria-live="polite">idle</div>
+        <div class="meter" aria-label="OTA progress"><span id="otaBar"></span></div>
+      </details>
     </section>
 
     <section class="card" aria-labelledby="logTitle">
@@ -306,6 +359,15 @@
       $("btnCycle").addEventListener("click", () => post("/api/preset/cycle"));
       $("btnSave").addEventListener("click", () => post("/api/preset/save"));
       $("btnMute").addEventListener("click", () => post("/api/mute"));
+
+      $("btnOta").addEventListener("click", () => {
+        const url = $("otaUrl").value.trim();
+        if (!url.startsWith("http://")) {
+          $("err").textContent = "OTA URL must start with http://";
+          return;
+        }
+        post("/api/ota", { url });
+      });
 
       $("btnTune").addEventListener("click", () => {
         const raw = parseFloat($("freqInput").value);
@@ -385,6 +447,8 @@
           $("footer").textContent = s.wifi_connected
             ? `${s.wifi_ssid} \u2022 vol ${s.volume}/15`
             : "WiFi offline";
+
+          updateOta(s.ota || { phase: "idle" });
         } catch (e) {
           $("err").textContent = `state: ${e.message}`;
         }
@@ -392,6 +456,61 @@
 
       refresh();
       setInterval(refresh, 1000);
+
+      // Map an OtaProgressDto into the status label + progress bar.
+      // Phases match `OtaProgressDto.phase` strings emitted by the
+      // server (see web.rs).
+      const updateOta = (ota) => {
+        const status = $("otaStatus");
+        const bar = $("otaBar");
+        const btn = $("btnOta");
+        status.classList.remove("ok", "fail");
+        // Idle / terminal phases re-enable the trigger; busy phases
+        // disable it so a double-click can't queue a second job.
+        const busy =
+          ota.phase === "connecting" ||
+          ota.phase === "downloading" ||
+          ota.phase === "activating";
+        btn.disabled = busy;
+        switch (ota.phase) {
+          case "idle":
+            status.textContent = "idle";
+            bar.style.width = "0%";
+            break;
+          case "connecting":
+            status.textContent = "connecting\u2026";
+            bar.style.width = "5%";
+            break;
+          case "downloading": {
+            const r = ota.received || 0;
+            if (ota.total) {
+              const pct = Math.min(100, Math.round((r * 100) / ota.total));
+              status.textContent = `downloading ${(r / 1024).toFixed(1)} / ${(ota.total / 1024).toFixed(1)} KiB (${pct}%)`;
+              bar.style.width = pct + "%";
+            } else {
+              status.textContent = `downloading ${(r / 1024).toFixed(1)} KiB`;
+              bar.style.width = "50%";
+            }
+            break;
+          }
+          case "activating":
+            status.textContent = "activating\u2026";
+            bar.style.width = "95%";
+            break;
+          case "success":
+            status.textContent = "success \u2014 reboot to run new firmware";
+            status.classList.add("ok");
+            bar.style.width = "100%";
+            break;
+          case "failed":
+            status.textContent = `failed: ${ota.reason || "unknown"}`;
+            status.classList.add("fail");
+            bar.style.width = "0%";
+            break;
+          default:
+            status.textContent = ota.phase;
+        }
+      };
 
       // Listening log refresh — once every 5 s. The buffer only
       // changes on PS / freq events, so polling more often would

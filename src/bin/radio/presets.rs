@@ -194,11 +194,6 @@ impl<'d> PresetStore<'d> {
   /// the rare hand-off explicitly. The radio task is expected to
   /// suspend `last_tuned` debounce flushes (`RadioState.ota_in_progress`)
   /// while paused so it doesn't accidentally hold a stale handle.
-  #[expect(
-    dead_code,
-    reason = "OTA writer is part of roadmap #11-2; pause/resume API ships now \
-              so the next PR can land in isolation"
-  )]
   #[must_use]
   pub fn pause(self) -> (FlashStorage<'d>, PausedPresetStore) {
     let token = PausedPresetStore {
@@ -215,11 +210,6 @@ impl<'d> PresetStore<'d> {
 /// Holds only `Copy` data (offset + cached snapshot) so the OTA flow
 /// can shove it onto the stack while it owns the flash handle without
 /// any allocation.
-#[expect(
-  dead_code,
-  reason = "Constructed by `PresetStore::pause` once the OTA writer (roadmap \
-            #11-2) lands"
-)]
 #[derive(Debug, Clone, Copy)]
 pub struct PausedPresetStore {
   offset: u32,
@@ -239,7 +229,6 @@ impl PausedPresetStore {
   /// the inactive app slot via [`esp_bootloader_esp_idf::ota_updater`]),
   /// so the cached snapshot remains authoritative. Skipping the read
   /// also means resume is allocation-free and cannot fail.
-  #[expect(dead_code, reason = "Used by the OTA writer once roadmap #11-2 lands")]
   #[must_use]
   pub fn resume<'d>(self, flash: FlashStorage<'d>) -> PresetStore<'d> {
     PresetStore {

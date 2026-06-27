@@ -281,6 +281,12 @@ pub struct RadioState {
   /// itself doesn't touch the `storage` partition, so this is purely a
   /// defensive interlock for the cooperative ownership transfer.
   pub ota_in_progress: bool,
+  /// Lifecycle phase of the most recent OTA job.
+  ///
+  /// Starts at [`OtaProgress::Idle`] and is advanced by `ota_task`. The
+  /// LAN web console polls this through `GET /api/state` (via
+  /// [`OtaProgressDto`]) to drive its progress bar / status label.
+  pub ota_progress: OtaProgress,
   /// True when fields have been mutated since the UI last read them.
   pub dirty: bool,
 }
@@ -308,14 +314,42 @@ impl RadioState {
       preset_idx: None,
       web_ip: None,
       ota_in_progress: false,
+      ota_progress: OtaProgress::Idle,
       dirty: true,
     }
   }
 }
 
 // ============================================================================
-// Globals (shared between tasks)
+// OTA progress state machine
 // ============================================================================
+
+/// Lifecycle phase of an OTA download + flash job.
+///
+/// Carries enough information for the LAN web console to render a useful
+/// status line without separate polling endpoints. Stays [`Copy`] (no
+/// heap fields, error reasons are `&'static str`) so cloning into the
+/// JSON serialiser is `memcpy`-cheap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, defmt::Format)]
+pub enum OtaProgress {
+  /// No OTA job has been started yet, or the previous job's terminal
+  /// state has been observed and reset.
+  Idle,
+  /// Resolving + connecting to the upstream HTTP server.
+  Connecting,
+  /// Streaming bytes into the inactive slot.
+  ///
+  /// `total = 0` means the server didn't return a `Content-Length`
+  /// header (e.g. chunked transfer); the UI should fall back to an
+  /// indeterminate spinner in that case.
+  Downloading { received: u32, total: u32 },
+  /// Final flush + OTA-data flip is in progress (sub-second).
+  Activating,
+  /// New image staged successfully; waiting for a manual reboot.
+  Success,
+  /// Update aborted. The running image is unchanged.
+  Failed(&'static str),
+}
 
 /// Bounded queue of input commands.
 ///
@@ -325,6 +359,39 @@ impl RadioState {
 /// deltas are pre-aggregated by `input_task` so a single tick produces at
 /// most one `TuneRelative` enqueue.
 pub static INPUT_CMDS: Channel<CriticalSectionRawMutex, RadioCommand, 8> = Channel::new();
+
+/// Single-slot mailbox for the OTA controller task.
+///
+/// Decoupled from [`INPUT_CMDS`] for two reasons:
+///
+/// 1. **Resource policy** — OTA uses the flash peripheral; only one
+///    job can be in flight. A single-slot signal naturally rate-limits
+///    re-triggers (a second `StartOta` posted while the first is
+///    running silently overwrites the queued URL, but the in-flight
+///    job keeps going).
+/// 2. **Lifetime** — the OTA task pauses the preset store, takes the
+///    flash, runs for ~30 s, then hands flash back. Routing this
+///    through the radio control task would block tuning for the full
+///    download.
+pub static OTA_CMDS: embassy_sync::signal::Signal<CriticalSectionRawMutex, OtaCommand> =
+  embassy_sync::signal::Signal::new();
+
+/// Commands accepted by the OTA controller task.
+#[derive(Clone, Debug)]
+pub enum OtaCommand {
+  /// Begin downloading + flashing a firmware image from a plain-HTTP URL.
+  Start(String),
+}
+
+impl defmt::Format for OtaCommand {
+  fn format(&self, fmt: defmt::Formatter<'_>) {
+    match self {
+      // Avoid leaking arbitrary URL contents through the defmt
+      // ringbuffer; the length is enough for diagnostics.
+      Self::Start(url) => defmt::write!(fmt, "Start(<url len={}>)", url.len()),
+    }
+  }
+}
 
 /// Shared radio state for the UI to read.
 pub static RADIO_STATE: Mutex<CriticalSectionRawMutex, RadioState> = Mutex::new(RadioState::boot());
@@ -446,14 +513,26 @@ pub async fn publish_web_ip(ip: Option<[u8; 4]>) {
 /// debounce work observes this flag on every tick, so a missed publish
 /// just delays a flash write by 200 ms — never produces a races on the
 /// flash peripheral itself.
-#[expect(
-  dead_code,
-  reason = "Wired up by the OTA task once roadmap #11-2 lands"
-)]
 pub async fn publish_ota_in_progress(in_progress: bool) {
   let mut state = RADIO_STATE.lock().await;
   if state.ota_in_progress != in_progress {
     state.ota_in_progress = in_progress;
+    state.dirty = true;
+  }
+}
+
+/// Publish a new [`OtaProgress`] phase.
+///
+/// Cheap to call: bails out early when the phase is unchanged so the
+/// UI's `dirty`-driven render loop doesn't get woken up just because
+/// the downloader passed another HTTP chunk through. The downloader
+/// reports byte counts via [`OtaProgress::Downloading`] explicitly so
+/// callers should re-publish on every meaningful threshold (currently
+/// every ~1% in [`crate::ota::run`]).
+pub async fn publish_ota_progress(progress: OtaProgress) {
+  let mut state = RADIO_STATE.lock().await;
+  if state.ota_progress != progress {
+    state.ota_progress = progress;
     state.dirty = true;
   }
 }

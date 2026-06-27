@@ -1,4 +1,3 @@
-
 # OTA Firmware Update — Technical Design
 
 > Status: **Phase 1 + 2a in progress** — partition table, flash hand-off, sector-buffered writer landed
@@ -378,3 +377,40 @@ command channel; the response funnels into `RadioState.ota_progress`.
   - Module is wired into `main.rs` with `#[expect(dead_code)]` until
     #11-3 (HTTP downloader) consumes it; `cargo make ci` and
     `cargo build --bin radio --release` both pass.
+- **2026-06-27** — Phases 2b–4 landed (#11-3 / #11-4 / #11-5 / #11-6 / #11-7):
+  - **#11-4** Image-header validation embedded in `OtaWriter::write_chunk`:
+    rejects streams whose first 24 bytes are not a valid ESP image
+    header (magic `0xE9` + matching `chip_id`) before any flash erase.
+  - **#11-5** Added `OtaCommand::Start(url)` + `OtaProgress` state
+    machine (`Idle` / `Connecting` / `Downloading{received,total}` /
+    `Activating` / `Success` / `Failed{reason}`). Progress is published
+    through `RADIO_STATE` so both the radio control task and the web
+    UI consume the same source of truth. `defmt::Format` is implemented
+    by hand on `OtaCommand` to avoid leaking URL contents into the
+    ringbuffer.
+  - **#11-3** Added `src/bin/radio/ota/http_download.rs` (~430 LoC,
+    plain-HTTP-only IPv4 downloader). Uses `embassy_net::tcp::TcpSocket`
+    directly (no TLS — see decision below), parses HTTP/1.0 status +
+    headers in-place, and streams the body straight into
+    `OtaWriter::write_chunk`. All large buffers (4 KiB RX, 1 KiB TX,
+    1 KiB read scratch) are heap-allocated.
+  - **#11-6** `POST /api/ota` accepts `{"url":"http://…"}`; the web
+    handler validates the scheme, replies `202 Accepted`, and pushes
+    an `OtaCommand::Start` onto the same SPSC channel the radio task
+    drains. `RadioStateDto` now exposes `ota: OtaProgressDto` so the
+    existing 1 Hz polling loop renders the progress bar without a
+    second endpoint. Index page gains a collapsible "Firmware update"
+    card with URL input, progress bar, and live status text.
+  - **#11-7** `ota::mark_current_app_valid` runs once, immediately
+    after the WiFi provisioner returns the flash handle and before
+    `PresetStore::open`. This commits the running image to the
+    bootloader's OTA-data so the device can't roll back on the next
+    reset. Failure is non-fatal (older partition layouts without
+    `otadata` simply skip the write).
+  - **HTTPS deferred**: TLS via `esp-mbedtls` would add ~150 KiB to
+    the image and meaningful boot-time/RAM cost. For the MVP, devices
+    pull from a local `python -m http.server` instance; HTTPS will
+    revisit when a public OTA channel is needed.
+  - `cargo make ci` + `cargo clippy --bin radio -- -D warnings` +
+    `cargo build --bin radio --release` all green.
+

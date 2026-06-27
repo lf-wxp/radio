@@ -1,4 +1,3 @@
-
 # OTA 固件升级 — 技术设计
 
 > 状态：**一期 + 二期a 进行中** —— 分区表、flash 交接、按扇区缓冲的 writer 已交付
@@ -117,11 +116,11 @@ sequenceDiagram
     OTA->>OTA: software_reset()
 ```
 
-### 4.3 Flash 句柄共享 —— “pause / resume” 交接机制
+### 4.3 Flash 句柄共享 —— "pause / resume" 交接机制
 
 **决策（2026-06-27 修订）**：原草案提议用全局 `Mutex<NoopRawMutex,
 FlashStorage>` 让所有写者共享，新方案予以否决，原因：项目中 flash
-句柄已经是“单主顺序交接”模式：
+句柄已经是"单主顺序交接"模式：
 
 ```
 FlashStorage::new(FLASH)
@@ -130,10 +129,10 @@ FlashStorage::new(FLASH)
               └─► （長期所有者，在 radio_control_task 内）
 ```
 
-OTA 是“一个设备一个月几次”的希有事件，预设口是“每次调台写一次”。
+OTA 是"一个设备一个月几次"的希有事件，预设口是"每次调台写一次"。
 为了支持一个少见事件而强制所有预设写入抢锁，是错误的权衡。
 
-改为为预设口增加轻量“pause” API：
+改为为预设口增加轻量"pause" API：
 
 ```rust
 impl PresetStore<'d> {
@@ -280,7 +279,7 @@ pub async fn run_http_ota(
 
 | 序号 | 任务                                                                       | 估时 (h) | 状态 |
 | ---- | -------------------------------------------------------------------------- | -------- | ---- |
-| 1    | 新增 `partitions.csv` + flash “pause/resume” 交接 + state 互锁              | 4        | ✅ 完成 |
+| 1    | 新增 `partitions.csv` + flash "pause/resume" 交接 + state 互锁              | 4        | ✅ 完成 |
 | 2    | 跳过 —— `esp-bootloader-esp-idf` 已提供 `Ota` / `OtaUpdater`            | 0        | 不适用 |
 | 3    | `src/bin/radio/ota/writer.rs`：按扇区缓冲的 NOR 写入 + 激活切槽                | 2        | ✅ 完成 |
 | 4    | `src/ota/http.rs`：reqwless 包装、Header 解析、重试策略                   | 6        | 待做 |
@@ -338,3 +337,34 @@ pub async fn run_http_ota(
   - 模块以 `#[expect(dead_code)]` 接入 `main.rs`，等待
     #11-3（HTTP 下载器）消费；`cargo make ci` 与
     `cargo build --bin radio --release` 均通过。
+- **2026-06-27** — 二期b – 四期 交付（#11-3 / #11-4 / #11-5 / #11-6 / #11-7）：
+  - **#11-4** 镜像头校验内嵌进 `OtaWriter::write_chunk`：在任何
+    flash 擦除发生前，对前 24 字节做 ESP image header 校验
+    （magic `0xE9` + 匹配的 `chip_id`），不通过即拒收整个流。
+  - **#11-5** 新增 `OtaCommand::Start(url)` + `OtaProgress` 状态机
+    （`Idle` / `Connecting` / `Downloading{received,total}` /
+    `Activating` / `Success` / `Failed{reason}`），通过
+    `RADIO_STATE` 发布，让 radio 控制任务和 web UI 共用同一份
+    源数据。`OtaCommand` 手写 `defmt::Format`，避免把 URL 内容
+    泄漏到 ringbuffer。
+  - **#11-3** 新增 `src/bin/radio/ota/http_download.rs`
+    （~430 行，仅支持纯 HTTP 的 IPv4 下载器）。直接使用
+    `embassy_net::tcp::TcpSocket`（不带 TLS，见下方决定），原地
+    解析 HTTP/1.0 状态码 + 头部，body 直接喂入
+    `OtaWriter::write_chunk`。所有大缓冲（4 KiB RX、1 KiB TX、
+    1 KiB 读取临时区）均堆分配。
+  - **#11-6** `POST /api/ota` 接收 `{"url":"http://…"}`；web
+    handler 校验 scheme，回 `202 Accepted`，把 `OtaCommand::Start`
+    推到 radio task 在消费的同一个 SPSC 通道。`RadioStateDto`
+    新增 `ota: OtaProgressDto`，复用既有 1 Hz 轮询渲染进度条，
+    无需第二个端点。前端首页新增可折叠的"Firmware update"卡片，
+    含 URL 输入、进度条与实时状态文本。
+  - **#11-7** `ota::mark_current_app_valid` 在 WiFi provisioner
+    把 flash handle 还回来后、`PresetStore::open` 之前执行一次，
+    把当前运行镜像 commit 到 bootloader OTA-data，防止下次
+    reset 时回滚。失败非致命（旧分区表无 `otadata` 时直接跳过）。
+  - **HTTPS 推迟**：经由 `esp-mbedtls` 引入 TLS 大约会增加
+    ~150 KiB 镜像 + 显著 boot/RAM 成本。MVP 阶段设备从局域网
+    `python -m http.server` 拉取即可；公网 OTA 通道立项再做。
+  - `cargo make ci` + `cargo clippy --bin radio -- -D warnings` +
+    `cargo build --bin radio --release` 全部绿色。
