@@ -173,6 +173,85 @@ impl<'d> PresetStore<'d> {
   }
 
   // ---------------------------------------------------------------------
+  // OTA flash hand-off
+  // ---------------------------------------------------------------------
+
+  /// Surrender the underlying [`FlashStorage`] handle so another
+  /// subsystem (currently OTA) can borrow it for the duration of an
+  /// update.
+  ///
+  /// Returns the live flash handle plus a [`PausedPresetStore`] token
+  /// that remembers the cached snapshot and on-flash offset; pair it
+  /// with [`PausedPresetStore::resume`] to put the store back together
+  /// once the borrower is done.
+  ///
+  /// Rationale: `esp-storage`'s `FlashStorage` is effectively a
+  /// singleton that can only have one live owner at a time, and the
+  /// OTA writer needs raw flash access to populate the inactive app
+  /// partition. Rather than wrapping the whole thing in a
+  /// `Mutex<FlashStorage>` (which would force every preset write to
+  /// acquire a lock just to support a once-per-month OTA), we model
+  /// the rare hand-off explicitly. The radio task is expected to
+  /// suspend `last_tuned` debounce flushes (`RadioState.ota_in_progress`)
+  /// while paused so it doesn't accidentally hold a stale handle.
+  #[expect(
+    dead_code,
+    reason = "OTA writer is part of roadmap #11-2; pause/resume API ships now \
+              so the next PR can land in isolation"
+  )]
+  #[must_use]
+  pub fn pause(self) -> (FlashStorage<'d>, PausedPresetStore) {
+    let token = PausedPresetStore {
+      offset: self.offset,
+      cached: self.cached,
+    };
+    (self.flash, token)
+  }
+}
+
+/// Opaque handle returned by [`PresetStore::pause`] used to reattach a
+/// previously surrendered [`FlashStorage`] back into a working store.
+///
+/// Holds only `Copy` data (offset + cached snapshot) so the OTA flow
+/// can shove it onto the stack while it owns the flash handle without
+/// any allocation.
+#[expect(
+  dead_code,
+  reason = "Constructed by `PresetStore::pause` once the OTA writer (roadmap \
+            #11-2) lands"
+)]
+#[derive(Debug, Clone, Copy)]
+pub struct PausedPresetStore {
+  offset: u32,
+  cached: PresetSet,
+}
+
+impl PausedPresetStore {
+  /// Reattach the flash handle and return a ready-to-use store.
+  ///
+  /// The cached snapshot is preserved verbatim — no flash read happens
+  /// here, so callers should call [`PresetStore::save_set`] (or one of
+  /// its convenience wrappers) to overwrite the on-flash record only
+  /// when they actually want to mutate it.
+  ///
+  /// We deliberately do *not* re-read from flash on resume: the OTA
+  /// writer never touches the `storage` partition (it only writes to
+  /// the inactive app slot via [`esp_bootloader_esp_idf::ota_updater`]),
+  /// so the cached snapshot remains authoritative. Skipping the read
+  /// also means resume is allocation-free and cannot fail.
+  #[expect(dead_code, reason = "Used by the OTA writer once roadmap #11-2 lands")]
+  #[must_use]
+  pub fn resume<'d>(self, flash: FlashStorage<'d>) -> PresetStore<'d> {
+    PresetStore {
+      flash,
+      offset: self.offset,
+      cached: self.cached,
+    }
+  }
+}
+
+impl<'d> PresetStore<'d> {
+  // ---------------------------------------------------------------------
   // Internal: flash codec
   // ---------------------------------------------------------------------
 

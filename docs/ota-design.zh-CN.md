@@ -1,9 +1,9 @@
 
 # OTA 固件升级 — 技术设计
 
-> 状态：**草案（实施暂缓）**
+> 状态：**一期进行中** —— 分区表 + flash 交接机制已交付
 > 作者：esp-radio 维护者
-> 最近更新：2026-06-25
+> 最近更新：2026-06-27
 > 跟踪：Roadmap 条目 *"通过 HTTP/HTTPS 实现 OTA 固件升级"*
 
 本文档在动手编码 **之前** 完成，把 OTA 升级所需的设计、悬而未决的问题
@@ -32,18 +32,20 @@
 | 关注点                       | 现状                                                                  |
 | ---------------------------- | --------------------------------------------------------------------- |
 | Bootloader                   | `esp-bootloader-esp-idf 0.5.0`（Cargo.toml 中已存在）                 |
-| 分区表                       | **espflash 默认 `single-app`**（无 `ota_0` / `ota_1` / `otadata`）   |
-| Flash 访问                   | `esp-storage 0.9.0`，`FlashStorage` 单例归 `WifiProvisioner` 所有    |
+| 分区表                       | **`partitions.csv` 已于 2026-06-27 交付**（`ota_0` / `ota_1` / `otadata`） |
+| Flash 访问                   | `esp-storage 0.9.0`；flash 句柄以 WiFi → 预设口 交接，OTA 从预设口借出     |
 | 网络栈                       | `embassy-net` + esp-radio Wi-Fi（`wifi_provision` 配网）             |
 | HTTP 客户端                  | **无**。`picoserve` 只是服务端。                                      |
 | TLS                          | 无。                                                                  |
 | App 描述符（`esp_app_desc`） | 已通过 `esp-bootloader-esp-idf::esp_app_desc!` 输出。                 |
+| OTA 原语描述                  | 已有 `esp-bootloader-esp-idf::ota::Ota` / `OtaUpdater`（无需重造轮子）  |
 
-两个结构性阻塞点：
+两个结构性阻塞点已解除：
 
-1. **分区表不存在**：单 app 槽，无法承载双槽 OTA。
-2. **Flash 句柄归属**：`FlashStorage::new(peripherals.FLASH)` 已被
-   `WifiProvisioner::new()` 取走且不释放，OTA 需要再借用同一个 `FLASH` 外设。
+1. ~~分区表不存在~~。✅ 解决：仓库根下的 `partitions.csv`。
+2. ~~Flash 句柄归属~~。✅ 解决：见 §4.3。现代 flash 句柄
+   已由 `WifiProvisioner` → `PresetStore`（通过 `into_flash()`）依次交接，
+   OTA 再通过新增的 `pause()` / `resume()` 从 `PresetStore` 借出。
 
 ---
 
@@ -115,21 +117,48 @@ sequenceDiagram
     OTA->>OTA: software_reset()
 ```
 
-### 4.3 Flash 句柄共享
+### 4.3 Flash 句柄共享 —— “pause / resume” 交接机制
 
-最干净的方案：在 `main` 中持有 **唯一的静态 `FlashStorage`**，外部通过
-`embassy_sync::mutex::Mutex<NoopRawMutex, FlashStorage>` 共享借用。
-`wifi_provision` 与 `ota` 协作访问。
+**决策（2026-06-27 修订）**：原草案提议用全局 `Mutex<NoopRawMutex,
+FlashStorage>` 让所有写者共享，新方案予以否决，原因：项目中 flash
+句柄已经是“单主顺序交接”模式：
 
-需要重构的接口：
+```
+FlashStorage::new(FLASH)
+  └─► WifiProvisioner::new(flash)
+        └─► provisioner.into_flash()  ──►  PresetStore::open(flash)
+              └─► （長期所有者，在 radio_control_task 内）
+```
 
-- `WifiProvisioner::new(flash, …)` → `WifiProvisioner::new(flash_mutex, …)`。
-- `wifi_provision::storage::CredentialStorage` 由"拥有"改为"借用"
-  `&Mutex<NoopRawMutex, FlashStorage>`。
-- `ota::Updater::new(flash_mutex, partitions)` 共用同一句柄。
+OTA 是“一个设备一个月几次”的希有事件，预设口是“每次调台写一次”。
+为了支持一个少见事件而强制所有预设写入抢锁，是错误的权衡。
 
-预估 diff：~120 行，集中在 `wifi_provision/{mod,storage}.rs` 与
-`bin/radio/main.rs`。
+改为为预设口增加轻量“pause” API：
+
+```rust
+impl PresetStore<'d> {
+    pub fn pause(self) -> (FlashStorage<'d>, PausedPresetStore);
+}
+impl PausedPresetStore {
+    pub fn resume<'d>(self, flash: FlashStorage<'d>) -> PresetStore<'d>;
+}
+```
+
+加上 `RadioState.ota_in_progress` 互锁，radio_control_task 在句柄被
+借走期间暂停 `last_tuned` debounce 刷盘（见 `tasks.rs` 中
+`flush_last_tuned_if_due`）。
+
+实际落地 diff：
+
+- `presets.rs`（+≈80 行）：`pause`、`resume`、`PausedPresetStore`、
+  文档。
+- `state.rs`（+≈30 行）：新增 `ota_in_progress` 字段 +
+  `publish_ota_in_progress` 帮手函数。
+- `tasks.rs`（+10 行）：`flush_last_tuned_if_due` 在
+  `RADIO_STATE.ota_in_progress` 为真时短路。
+
+原荐荐 `Mutex` 重构预计 ~120 行；实际落地仅为其四分之一，且稳态朋
+锁。
 
 ---
 
@@ -197,11 +226,17 @@ impl<'a> OtaUpdater<'a> {
   UI 渲染出第一帧 + Wi-Fi 重新连上之后才调用
   `Ota::mark_current_valid()`。
 
-### 7.2 存量设备迁移（NVS 偏移变化）
-- 当前默认分区表的 NVS 偏移与新分区表不一致，首次刷入 OTA 版固件后
-  原配网信息不可读。
-- **缓解**：新增 `cargo make migrate-flash` 任务，刷写前先擦除 NVS；
-  在 changelog 中明确"一次性重新配网"的步骤。
+### 7.2 存量设备迁移（Wi-Fi 凭据）
+- 收音机的 WiFi 凭据存在 **flash 芯片的最后一个 sector**
+  （`0x3F_F000`），由
+  `wifi_provision::storage::DEFAULT_STORAGE_OFFSET` 决定。
+- 新 `partitions.csv` 的 `storage` 横跨 `0x3E_0000`–`0x400000`，
+  **包含该 sector**；存量设备在分区表变更后 **仍能读出原凭据**，
+  无需迁移脚本。
+- 预设记录（`0x3E_0000`，见 `presets::DEFAULT_PRESET_OFFSET`）同样位于
+  新 `storage` 分区内，也不会丢。
+- **例外**：*首次*刷入新分区表需同时刷入 bootloader + 分区表本身，
+  是一次性全量重刷。后续固件走常规 OTA 路径，用户无感。
 
 ### 7.3 HTTPS 证书管理
 - 嵌入完整 CA 证书库太重，固定单根证书又脆弱。
@@ -214,30 +249,32 @@ impl<'a> OtaUpdater<'a> {
   自动重试每次会话上限 3 次。
 
 ### 7.5 Flash 并发写
-- OTA 进行时 `wifi_provision` 可能也要写入凭据。
-- **缓解**：§4.3 的 `Mutex<FlashStorage>` 强制串行；OTA 每次只在
-  写入一个 ~4 KiB chunk 时持锁，保证配网写入仍可及时穿插。
+- `wifi_provision` 与预设记录都会写 `storage` 分区；OTA 则需要
+  拿到整个 flash 句柄以写入高序应用槽。
+- **缓解**：见 §4.3。`pause` / `resume` 交接 + `ota_in_progress` 互锁
+  让每个写者均被串行化，且皆不需要热路径上的运行期 mutex。
 
 ---
 
 ## 8. 工作量分解（按推进顺序）
 
-| 序号 | 任务                                                                       | 估时 (h) |
-| ---- | -------------------------------------------------------------------------- | -------- |
-| 1    | 新增 `partitions.csv`，在 `Makefile.toml` 串联 espflash 参数              | 2        |
-| 2    | 重构 `FlashStorage` 归属为共享 `Mutex`（含 provisioner 改造）             | 4        |
-| 3    | `src/ota/writer.rs`：感知分区的分块写入 + 单元测试                         | 4        |
-| 4    | `src/ota/http.rs`：reqwless 包装、Header 解析、重试策略                   | 6        |
-| 5    | `src/ota/verify.rs`：`esp_app_desc` 解析、magic / CRC 校验                | 3        |
-| 6    | 在 `tasks.rs` 接入 `RadioCommand::StartOta`，进度通道贯通                  | 3        |
-| 7    | Slint UI 进度浮层 + 成功/失败提示                                           | 4        |
-| 8    | 启动健康后调用 `mark_app_valid_cancel_rollback`                            | 2        |
-| 9    | HTTPS feature flag + 固定根证书（`embedded-tls`）                          | 6        |
-| 10   | 端到端硬件验证：刷 A → OTA 到 B → 重启 → OTA 回 A                          | 4        |
-| 11   | 文档：README 更新、迁移说明、故障排查                                       | 2        |
-|      | **合计**                                                                    | **40**   |
+| 序号 | 任务                                                                       | 估时 (h) | 状态 |
+| ---- | -------------------------------------------------------------------------- | -------- | ---- |
+| 1    | 新增 `partitions.csv` + flash “pause/resume” 交接 + state 互锁              | 4        | ✅ 完成 |
+| 2    | 跳过 —— `esp-bootloader-esp-idf` 已提供 `Ota` / `OtaUpdater`            | 0        | 不适用 |
+| 3    | `src/ota/writer.rs`：在 `OtaUpdater::next_partition` 上加薄包装             | 2        | 待做 |
+| 4    | `src/ota/http.rs`：reqwless 包装、Header 解析、重试策略                   | 6        | 待做 |
+| 5    | `src/ota/verify.rs`：SHA-256 校验 + `esp_app_desc` 完整性检查            | 3        | 待做 |
+| 6    | 在 `tasks.rs` 接入 `RadioCommand::StartOta`，进度通道贯通                  | 3        | 待做 |
+| 7    | Slint UI 进度浮层 + 成功/失败提示                                           | 4        | 待做 |
+| 8    | 启动健康后调用 `mark_app_valid_cancel_rollback`                            | 2        | 待做 |
+| 9    | HTTPS feature flag + 固定根证书（`embedded-tls`）                          | 6        | 暂缓 |
+| 10   | 端到端硬件验证：刷 A → OTA 到 B → 重启 → OTA 回 A                          | 4        | 待做 |
+| 11   | 文档：README 更新、迁移说明、故障排查                                       | 2        | 待做 |
+|      | **合计（不含暂缓 TLS）**                                                  | **24**   |      |
 
-> 单人 + 实物板，约 5 个工作日。
+> 单人 + 实物板，约 3 个工作日。由于跳过了 `Mutex` 重构、且复用上游的 OTA
+> 原语描述，原 5 人天预估可压缩到 3 人天。
 
 ---
 
@@ -256,3 +293,12 @@ impl<'a> OtaUpdater<'a> {
 
 - **2026-06-25** — 暂缓实施。本文档作为权威参考，启动 OTA 编码前需
   先回到这里检查。
+- **2026-06-27** — 一期交付（#11-1）：
+  - 新增 `partitions.csv`（4 MiB 布局，含 `ota_0` / `ota_1`）。
+  - 原设计的 `Mutex<FlashStorage>` 被明示的 `PresetStore::pause()` /
+    `resume()` 交接 + `ota_in_progress` 互锁取代；实际代码量仅为原预估
+    的 ~30 %。
+  - 决定复用 `esp-bootloader-esp-idf::ota::Ota` / `OtaUpdater`，不再自
+    写 `src/ota/writer.rs`，二期工作量从 4 小时压缩到2 小时。
+  - 明确存量设备在分区表更换后仍保留 Wi-Fi 凭据（凭据 sector
+    位于 `0x3F_F000`，恰在新 `storage` 分区内）。

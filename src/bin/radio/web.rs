@@ -288,11 +288,11 @@ async fn handle_get_health() -> picoserve::response::Json<HealthDto> {
     // the web task starts after POST, but handle gracefully).
     let free = diagnostics::heap_free_bytes();
     let total = diagnostics::heap_total_bytes();
-    let usage_pct = if total > 0 {
-      ((total - free) * 100 / total) as u8
-    } else {
-      0
-    };
+    let usage_pct = total
+      .checked_sub(free)
+      .and_then(|used| used.checked_mul(100))
+      .and_then(|num| num.checked_div(total))
+      .unwrap_or(0) as u8;
     HealthDto {
       uptime_secs: diagnostics::uptime_secs(),
       heap_free: free,

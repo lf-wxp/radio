@@ -1,0 +1,31 @@
+# Name,   Type, SubType, Offset,   Size,     Flags
+# -----------------------------------------------------------------------------
+# esp-radio OTA partition table (4 MiB flash, ESP32-C6).
+#
+# Layout decisions:
+#   - `nvs`     reserved for future Wi-Fi / system NVS use; the radio's
+#               existing credential store actually lives in the *last* sector
+#               of the `storage` partition (0x3F_F000), see
+#               `wifi_provision::storage::DEFAULT_STORAGE_OFFSET`. Keeping
+#               that offset inside `storage` means existing devices keep
+#               their saved Wi-Fi config across the partition-table change.
+#   - `otadata` two-sector slot the bootloader uses to track which
+#               app slot to boot (and rollback bookkeeping).
+#   - `ota_0`   primary app slot at 0x20000 — same offset espflash uses for
+#               the `single-app` factory image, so a single re-flash with
+#               `--partition-table partitions.csv` migrates existing devices
+#               in place (no double-flash required).
+#   - `ota_1`   secondary app slot. ~1.875 MiB each; current release build
+#               is ~1.1 MiB so we have ~750 KiB headroom for growth.
+#   - `storage` 128 KiB region used by the radio for both presets
+#               (offset 0x3E_0000, see `presets::DEFAULT_PRESET_OFFSET`)
+#               and Wi-Fi credentials (offset 0x3F_F000).
+#
+# When updating: bump the offsets coherently and then re-flash the
+# bootloader + partition table + ota_0 in one go to avoid stale otadata.
+nvs,      data, nvs,     0x9000,   0x6000,
+phy_init, data, phy,     0xf000,   0x1000,
+otadata,  data, ota,     0x10000,  0x2000,
+ota_0,    app,  ota_0,   0x20000,  0x1E0000,
+ota_1,    app,  ota_1,   0x200000, 0x1E0000,
+storage,  data, nvs,     0x3E0000, 0x20000,

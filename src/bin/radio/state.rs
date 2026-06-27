@@ -271,6 +271,16 @@ pub struct RadioState {
   /// LCD lets the listener type it into a phone browser without
   /// digging through the router admin panel.
   pub web_ip: Option<[u8; 4]>,
+  /// True while an OTA update is actively writing to flash.
+  ///
+  /// Set by `ota_task` while it owns the flash handle on loan from the
+  /// preset store (see [`crate::presets::PresetStore::pause`]). Other
+  /// flash writers (the `last_tuned` debounce flush, preset save) MUST
+  /// short-circuit while this is true so they don't try to write a
+  /// flash sector that no longer belongs to them. The OTA writer
+  /// itself doesn't touch the `storage` partition, so this is purely a
+  /// defensive interlock for the cooperative ownership transfer.
+  pub ota_in_progress: bool,
   /// True when fields have been mutated since the UI last read them.
   pub dirty: bool,
 }
@@ -297,6 +307,7 @@ impl RadioState {
       presets: PresetSet::empty(),
       preset_idx: None,
       web_ip: None,
+      ota_in_progress: false,
       dirty: true,
     }
   }
@@ -422,6 +433,27 @@ pub async fn publish_web_ip(ip: Option<[u8; 4]>) {
   let mut state = RADIO_STATE.lock().await;
   if state.web_ip != ip {
     state.web_ip = ip;
+    state.dirty = true;
+  }
+}
+
+/// Mark whether an OTA update is in flight.
+///
+/// Acts as the cooperative interlock between the OTA writer (which
+/// borrows the flash handle from the preset store via
+/// [`crate::presets::PresetStore::pause`]) and the radio control task
+/// (which would otherwise try to flush `last_tuned` mid-update). Idle
+/// debounce work observes this flag on every tick, so a missed publish
+/// just delays a flash write by 200 ms — never produces a races on the
+/// flash peripheral itself.
+#[expect(
+  dead_code,
+  reason = "Wired up by the OTA task once roadmap #11-2 lands"
+)]
+pub async fn publish_ota_in_progress(in_progress: bool) {
+  let mut state = RADIO_STATE.lock().await;
+  if state.ota_in_progress != in_progress {
+    state.ota_in_progress = in_progress;
     state.dirty = true;
   }
 }

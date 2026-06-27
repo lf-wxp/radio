@@ -333,7 +333,7 @@ async fn main(spawner: Spawner) -> ! {
   };
 
   static POST_RESULT: StaticCell<PostResult> = StaticCell::new();
-  let post_ref: &'static PostResult = POST_RESULT.init(post_result.clone());
+  let post_ref: &'static PostResult = POST_RESULT.init(post_result);
   diagnostics::set_post_result(post_ref);
 
   if !post_result.all_pass() {

@@ -510,6 +510,13 @@ pub async fn radio_control_task(
 /// the actual trigger rate is at most once per tune session — negligible
 /// impact on the 200 ms tick cadence and input responsiveness.
 ///
+/// **OTA interlock**: skips entirely while `RADIO_STATE.ota_in_progress`
+/// is true. During an OTA the flash handle has been loaned out via
+/// [`PresetStore::pause`], so issuing a write here would either panic
+/// (if the loan was already taken) or — worse — race the OTA writer.
+/// The debounce timer keeps ticking; we'll flush on the next idle tick
+/// after OTA completes.
+///
 /// Failures are non-fatal — we log and clear the pending mark so we
 /// don't busy-loop retrying on a dead flash.
 fn flush_last_tuned_if_due(store: &mut PresetStore<'static>, pending: &mut Option<(u16, Instant)>) {
@@ -517,6 +524,16 @@ fn flush_last_tuned_if_due(store: &mut PresetStore<'static>, pending: &mut Optio
     return;
   };
   if since.elapsed() < Duration::from_millis(LAST_TUNED_DEBOUNCE_MS) {
+    return;
+  }
+  // OTA cooperative interlock: avoid touching flash while the handle
+  // is loaned out. `try_lock` keeps this synchronous (the surrounding
+  // function is called from a non-async tick) and tolerates the rare
+  // case where the UI task happens to hold the lock — we'll just try
+  // again on the next 200 ms tick.
+  if let Ok(state) = RADIO_STATE.try_lock()
+    && state.ota_in_progress
+  {
     return;
   }
   match store.record_last_tuned(freq) {

@@ -1,9 +1,9 @@
 
 # OTA Firmware Update — Technical Design
 
-> Status: **Draft (deferred implementation)**
+> Status: **Phase 1 in progress** — partition table + flash hand-off shipped
 > Author: esp-radio maintainers
-> Last updated: 2026-06-25
+> Last updated: 2026-06-27
 > Tracking: Roadmap item *"OTA firmware update via HTTP/HTTPS"*
 
 This document captures the design, the open questions and the actionable
@@ -39,19 +39,21 @@ investigation.
 | Concern                          | Current state                                                          |
 | -------------------------------- | ---------------------------------------------------------------------- |
 | Bootloader                       | `esp-bootloader-esp-idf 0.5.0` (already in `Cargo.toml`)               |
-| Partition layout                 | **espflash default `single-app`** (no `ota_0` / `ota_1` / `otadata`)   |
-| Flash access                     | `esp-storage 0.9.0`, single `FlashStorage` owned by `WifiProvisioner`  |
+| Partition layout                 | **`partitions.csv` shipped 2026-06-27** (ota_0 / ota_1 / otadata)      |
+| Flash access                     | `esp-storage 0.9.0`; handle threaded WiFi → presets, OTA borrows it    |
 | Network stack                    | `embassy-net` + esp-radio Wi-Fi (provisioned via `wifi_provision`)     |
 | HTTP client                      | **None.** `picoserve` is server-only.                                  |
 | TLS                              | None.                                                                  |
 | App descriptor (`esp_app_desc`)  | Emitted by `esp-bootloader-esp-idf::esp_app_desc!` (already used).     |
+| OTA primitives                   | `esp-bootloader-esp-idf::ota::Ota` + `OtaUpdater` (no need to re-roll) |
 
-The two structural blockers are:
+The two structural blockers were:
 
-1. **No partition table** capable of holding two app slots.
-2. **Flash handle ownership** — `FlashStorage::new(peripherals.FLASH)` is
-   moved into `WifiProvisioner::new()` and never released. OTA needs a
-   second consumer of the same `FLASH` peripheral.
+1. ~~No partition table capable of holding two app slots.~~ ✅ Resolved: see `partitions.csv` at the repo root.
+2. ~~Flash handle ownership.~~ ✅ Resolved: see § 4.3. The flash
+   handle is already passed `WifiProvisioner` → `PresetStore` (via
+   `into_flash()`); OTA further borrows it from `PresetStore` via the
+   new `pause()` / `resume()` API.
 
 ---
 
@@ -126,22 +128,50 @@ sequenceDiagram
     OTA->>OTA: software_reset()
 ```
 
-### 4.3 Flash-handle sharing
+### 4.3 Flash-handle sharing — "pause / resume" hand-off
 
-The cleanest fix is to expose `FlashStorage` as a **single static owned by
-`main`**, then hand out short-lived references guarded by an
-`embassy_sync::mutex::Mutex<NoopRawMutex, FlashStorage>`. Both
-`wifi_provision` and `ota` borrow it cooperatively.
+**Decision (2026-06-27, revised):** the original draft proposed a
+global `Mutex<NoopRawMutex, FlashStorage>` shared by every writer. We
+rejected that in favour of an explicit single-owner hand-off because
+the project already threads the flash handle through unique owners:
 
-Refactor surface:
+```
+FlashStorage::new(FLASH)
+  └─► WifiProvisioner::new(flash)
+        └─► provisioner.into_flash()  ──►  PresetStore::open(flash)
+              └─► (long-lived owner inside radio_control_task)
+```
 
-- `WifiProvisioner::new(flash, …)` → `WifiProvisioner::new(flash_mutex, …)`.
-- `wifi_provision::storage::CredentialStorage` takes
-  `&Mutex<NoopRawMutex, FlashStorage>` instead of owning it.
-- `ota::Updater::new(flash_mutex, partitions)` reuses the same handle.
+OTA happens at most a handful of times per device-month, while the
+preset store writes once per tune session. Forcing every preset write
+to acquire a mutex just to support a rare OTA is the wrong trade-off.
 
-Estimated diff: ~120 LoC across `wifi_provision/{mod,storage}.rs` and
-`bin/radio/main.rs`.
+Instead the preset store gains a small "pause" API:
+
+```rust
+impl PresetStore<'d> {
+    pub fn pause(self) -> (FlashStorage<'d>, PausedPresetStore);
+}
+impl PausedPresetStore {
+    pub fn resume<'d>(self, flash: FlashStorage<'d>) -> PresetStore<'d>;
+}
+```
+
+…paired with a `RadioState.ota_in_progress` interlock so the radio
+control task suspends `last_tuned` debounce flushes while the handle
+is loaned out (see `flush_last_tuned_if_due` in `tasks.rs`).
+
+Refactor surface (actual diff that landed):
+
+- `presets.rs` (+~80 LoC): `pause`, `resume`, `PausedPresetStore`,
+  documentation.
+- `state.rs` (+~30 LoC): `ota_in_progress` field +
+  `publish_ota_in_progress` helper.
+- `tasks.rs` (+10 LoC): `flush_last_tuned_if_due` short-circuits when
+  `RADIO_STATE.ota_in_progress` is set.
+
+This is roughly a quarter of the size of the original `Mutex`-based
+proposal and keeps the steady-state lock-free.
 
 ---
 
@@ -210,13 +240,22 @@ command channel; the response funnels into `RadioState.ota_progress`.
   application to call `Ota::mark_current_valid()` only after the UI thread
   has rendered a frame and Wi-Fi is up.
 
-### 7.2 Existing device migration (NVS offset)
-- The current default partition table places NVS at a different offset
-  than the proposed one, so previously-stored Wi-Fi credentials will be
-  unreadable after the first OTA-capable flash.
-- **Mitigation:** add a `cargo make migrate-flash` task that erases NVS
-  before flashing the OTA-capable firmware, and document a one-time
-  re-provisioning step in the changelog.
+### 7.2 Existing device migration (Wi-Fi credentials)
+
+- The radio's WiFi credentials are stored in the **last sector of the
+  flash chip** (`0x3F_F000`), set by
+  `wifi_provision::storage::DEFAULT_STORAGE_OFFSET`.
+- The new `partitions.csv` places `storage` at `0x3E_0000`–`0x400000`,
+  which **includes** that exact sector; existing devices therefore
+  retain their saved Wi-Fi config across the partition-table change
+  with **no migration step required**.
+- The radio's preset record (`0x3E_0000`, see
+  `presets::DEFAULT_PRESET_OFFSET`) likewise lives inside the new
+  `storage` partition and is preserved.
+- **Caveat:** the *first* flash with the new partition table still
+  needs to write the bootloader + partition table itself, so it is a
+  one-shot full re-flash. Subsequent firmware bumps are the regular
+  OTA path with no end-user friction.
 
 ### 7.3 HTTPS certificate management
 - Embedding a CA bundle is heavyweight; pinning a single certificate is
@@ -230,31 +269,35 @@ command channel; the response funnels into `RadioState.ota_progress`.
   Cap automatic retries at 3 per session.
 
 ### 7.5 Concurrent flash access
-- `wifi_provision` may write credentials while OTA is running.
-- **Mitigation:** the `Mutex<FlashStorage>` from § 4.3 serialises access;
-  OTA holds the mutex only while writing a chunk (~4 KiB) to keep
-  credential writes responsive.
+- `wifi_provision` and the preset store both write to the `storage`
+  partition; the OTA writer needs the *whole* flash handle to populate
+  an inactive app slot.
+- **Mitigation:** see § 4.3. The `pause` / `resume` hand-off plus the
+  `ota_in_progress` interlock keeps every writer serialised without
+  introducing a runtime mutex on the hot path.
 
 ---
 
 ## 8. Work Breakdown (estimated, ordered)
 
-| #  | Task                                                                          | Est. (h) |
-| -- | ----------------------------------------------------------------------------- | -------- |
-| 1  | Add `partitions.csv` + wire espflash flags in `Makefile.toml`                  | 2        |
-| 2  | Refactor `FlashStorage` ownership into shared `Mutex` (incl. provisioner)     | 4        |
-| 3  | New `src/ota/writer.rs` — partition-aware chunked writer + unit tests          | 4        |
-| 4  | New `src/ota/http.rs` — reqwless wrapper, header parsing, retry policy        | 6        |
-| 5  | New `src/ota/verify.rs` — `esp_app_desc` parsing, magic/CRC checks            | 3        |
-| 6  | Hook `RadioCommand::StartOta` into `tasks.rs`, progress channel               | 3        |
-| 7  | UI overlay (Slint) for progress %, success/failure                            | 4        |
-| 8  | `mark_app_valid_cancel_rollback` on healthy boot                              | 2        |
-| 9  | HTTPS feature flag + pinned-cert support (`embedded-tls`)                     | 6        |
-| 10 | E2E hardware test: flash A → OTA to B → reboot → OTA back to A                | 4        |
-| 11 | Docs: README updates, migration note, troubleshooting                         | 2        |
-|    | **Total**                                                                     | **40**   |
+| #  | Task                                                                          | Est. (h) | Status   |
+| -- | ----------------------------------------------------------------------------- | -------- | -------- |
+| 1  | Add `partitions.csv` + flash hand-off (`pause`/`resume`) + state interlock    | 4        | ✅ done  |
+| 2  | Skipped — `esp-bootloader-esp-idf` already provides `Ota` / `OtaUpdater`      | 0        | n/a      |
+| 3  | New `src/ota/writer.rs` thin wrapper over `OtaUpdater::next_partition`        | 2        | pending  |
+| 4  | New `src/ota/http.rs` — reqwless wrapper, header parsing, retry policy        | 6        | pending  |
+| 5  | New `src/ota/verify.rs` — SHA-256 check + `esp_app_desc` sanity               | 3        | pending  |
+| 6  | Hook `RadioCommand::StartOta` into `tasks.rs`, progress channel               | 3        | pending  |
+| 7  | UI overlay (Slint) for progress %, success/failure                            | 4        | pending  |
+| 8  | `mark_app_valid_cancel_rollback` on healthy boot                              | 2        | pending  |
+| 9  | HTTPS feature flag + pinned-cert support (`embedded-tls`)                     | 6        | deferred |
+| 10 | E2E hardware test: flash A → OTA to B → reboot → OTA back to A                | 4        | pending  |
+| 11 | Docs: README updates, migration note, troubleshooting                         | 2        | pending  |
+|    | **Total (excluding deferred TLS)**                                            | **24**   |          |
 
-> ≈ 5 working days for a single engineer with the hardware on hand.
+> ≈ 3 working days for a single engineer with the hardware on hand —
+> down from the original 5-day estimate now that we get to skip the
+> `Mutex` refactor and reuse the upstream OTA primitives.
 
 ---
 
@@ -274,3 +317,14 @@ command channel; the response funnels into `RadioState.ota_progress`.
 
 - **2026-06-25** — Implementation deferred. This document is the canonical
   reference; revisit before starting any OTA-related coding work.
+- **2026-06-27** — Phase 1 landed (#11-1):
+  - Added `partitions.csv` (4 MiB layout with `ota_0` / `ota_1`).
+  - Replaced the proposed `Mutex<FlashStorage>` with an explicit
+    `PresetStore::pause()` / `resume()` hand-off + `ota_in_progress`
+    interlock; ~30 % of the original LoC budget.
+  - Decided to reuse `esp-bootloader-esp-idf::ota::Ota` /
+    `OtaUpdater` instead of writing a custom `src/ota/writer.rs`,
+    cutting Phase 2 effort from 4 h to 2 h.
+  - Documented that existing devices keep their Wi-Fi credentials
+    across the partition-table change (the credential sector at
+    `0x3F_F000` already falls inside the new `storage` partition).
